@@ -1,0 +1,97 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/ui/title_screen.gd" id="1_title"]
+
+[node name="TitleScreen" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_title")
+
+[node name="Background" type="ColorRect" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+color = Color(0.07, 0.06, 0.06, 1)
+
+[node name="Center" type="VBoxContainer" parent="."]
+layout_mode = 1
+anchors_preset = 8
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -200.0
+offset_top = -200.0
+offset_right = 200.0
+offset_bottom = 200.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_constants/separation = 14
+alignment = 1
+
+[node name="Title" type="Label" parent="Center"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.85, 0.78, 0.66, 1)
+theme_override_font_sizes/font_size = 64
+text = "{{GAME_NAME_UPPER}}"
+horizontal_alignment = 1
+
+[node name="Subtitle" type="Label" parent="Center"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.62, 0.32, 0.24, 1)
+theme_override_font_sizes/font_size = 18
+text = "{{PITCH}}"
+horizontal_alignment = 1
+
+[node name="Spacer" type="Control" parent="Center"]
+custom_minimum_size = Vector2(0, 24)
+layout_mode = 2
+
+[node name="NewCampaign" type="Button" parent="Center"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 40)
+layout_mode = 2
+text = "New Campaign"
+
+[node name="Continue" type="Button" parent="Center"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 40)
+layout_mode = 2
+text = "Continue"
+
+[node name="Skirmish" type="Button" parent="Center"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 40)
+layout_mode = 2
+text = "Quick Play (M1)"
+
+[node name="Quit" type="Button" parent="Center"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 40)
+layout_mode = 2
+text = "Quit"
+
+[node name="Version" type="Label" parent="."]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 3
+anchor_left = 1.0
+anchor_top = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = -120.0
+offset_top = -30.0
+offset_right = -10.0
+offset_bottom = -8.0
+grow_horizontal = 0
+grow_vertical = 0
+theme_override_colors/font_color = Color(0.5, 0.46, 0.42, 1)
+text = "v0.0.0"
+horizontal_alignment = 2

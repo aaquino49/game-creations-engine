@@ -1,0 +1,34 @@
+# Godot
+game/.godot/
+*.tmp
+Thumbs.db
+desktop.ini
+
+# Orchestrator runtime (logs, prompts, screenshots, live status) - not versioned
+project/runs/
+project/STATUS.md
+project/events.log
+project/STOP
+__pycache__/
+
+# Builds
+builds/
+
+# Agent scratch output (workers keep leaving these in the repo root or game/)
+/screenshot_*.png
+/screenshot_log.txt
+/*.log
+/*_out.txt
+/err*.txt
+/out*.txt
+/smoke*.txt
+/test_output*.txt
+/tests_output*.txt
+/output*.txt
+/temp*.txt
+/tmp_*
+/game/*.log
+/game/*_out.txt
+/game/tmp_*
+/game/dev_compile.gd*
+project/RESTART

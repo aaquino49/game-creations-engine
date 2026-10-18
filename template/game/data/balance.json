@@ -1,0 +1,4 @@
+{
+  "_doc": "Global tunables. Content tables live in their own files, keyed by id. See project/GDD.md.",
+  "example_tunable": 1
+}

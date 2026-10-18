@@ -1,0 +1,223 @@
+{
+  "max_attempts": 3,
+  "plan_every_n_done": 6,
+  "agent_timeout_minutes": 60,
+  "stuck_retry_minutes": 60,
+  "godot": "godot",
+  "coders": [
+    "muse_paid"
+  ],
+  "agents": {
+    "claude": {
+      "cmd": [
+        "claude",
+        "-p",
+        "{prompt}",
+        "--model",
+        "claude-opus-5-5",
+        "--dangerously-skip-permissions"
+      ]
+    },
+    "deepseek": {
+      "cmd": [
+        "opencode",
+        "run",
+        "--auto",
+        "--print-logs",
+        "--log-level",
+        "ERROR",
+        "-m",
+        "opencode/deepseek-v4.1-flash-free",
+        "{prompt}"
+      ],
+      "watch_rate_limit": true
+    },
+    "muse": {
+      "cmd": [
+        "opencode",
+        "run",
+        "--auto",
+        "--print-logs",
+        "--log-level",
+        "ERROR",
+        "-m",
+        "opencode/muse-spark-1.3-contributor-free",
+        "{prompt}"
+      ],
+      "watch_rate_limit": true
+    },
+    "codex": {
+      "cmd": [
+        "codex",
+        "exec",
+        "-m",
+        "gpt-6.1-sol",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--skip-git-repo-check",
+        "{prompt}",
+        "{images}"
+      ]
+    },
+    "muse_paid": {
+      "cmd": [
+        "opencode",
+        "run",
+        "--auto",
+        "--print-logs",
+        "--log-level",
+        "ERROR",
+        "-m",
+        "meta/muse-spark-1.3-contributor",
+        "{prompt}"
+      ],
+      "watch_rate_limit": true
+    },
+    "codex_luna": {
+      "cmd": [
+        "codex",
+        "exec",
+        "-m",
+        "gpt-6-luna",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--skip-git-repo-check",
+        "{prompt}"
+      ]
+    },
+    "beam": {
+      "cmd": [
+        "opencode",
+        "run",
+        "--auto",
+        "--print-logs",
+        "--log-level",
+        "ERROR",
+        "-m",
+        "opencode/beam-free",
+        "{prompt}"
+      ],
+      "watch_rate_limit": true
+    },
+    "longcat": {
+      "cmd": [
+        "opencode",
+        "run",
+        "--auto",
+        "--print-logs",
+        "--log-level",
+        "ERROR",
+        "-m",
+        "opencode/longcat-2.5-preview-free",
+        "{prompt}"
+      ],
+      "watch_rate_limit": true
+    }
+  },
+  "fallback": {
+    "deepseek:*": [
+      "muse",
+      "muse_paid"
+    ],
+    "muse:*": [
+      "deepseek",
+      "muse_paid"
+    ],
+    "codex:qa": [
+      "beam",
+      "longcat",
+      "deepseek",
+      "muse",
+      "muse_paid"
+    ],
+    "codex:work-qa": [
+      "beam",
+      "longcat",
+      "deepseek",
+      "muse",
+      "muse_paid"
+    ],
+    "codex:work-asset": [],
+    "claude:*": [
+      "codex",
+      "muse_paid"
+    ],
+    "codex_luna:*": [
+      "beam",
+      "longcat",
+      "deepseek",
+      "muse",
+      "muse_paid"
+    ],
+    "beam:*": [
+      "longcat",
+      "deepseek",
+      "muse",
+      "muse_paid"
+    ],
+    "longcat:*": [
+      "beam",
+      "deepseek",
+      "muse",
+      "muse_paid"
+    ],
+    "muse_paid:*": [
+      "codex_luna",
+      "beam",
+      "longcat",
+      "deepseek"
+    ]
+  },
+  "_fallback_notes": "Owner policy (2026-10-15): the free OpenCode models (DeepSeek V4.1 Flash, Muse Spark 1.3 Contributor) are the workhorse coders, one per lane, alternating on retries. Codex (GPT-6.1-Sol) does QA and art. Claude plans and reviews. Paid Muse Spark 1.3 Contributor (meta/ via OpenCode) is used only when the free tier runs out. QA falls to the free model that did NOT write the code. 2026-10-16: free Beam and LongCat 2.5 preview added ahead of DeepSeek/Muse and paid Muse (benchmarked: both fixed a GDScript rule bug correctly; the other free models were rate-limited or hung).",
+  "stop_on_usage_limit": false,
+  "expansion_after_v1": true,
+  "default_limit_minutes": 60,
+  "probe_every_minutes": 15,
+  "godot_watchdog_minutes": 10,
+  "lane_b": {
+    "enabled": true,
+    "dir": "C:/Users/<you>/gh_laneB",
+    "merge_wait_minutes": 120
+  },
+  "handoff_at_percent": {
+    "primary": 97,
+    "secondary": 98
+  },
+  "notify": {
+    "ntfy_topic": "<your-topic>",
+    "email": "",
+    "min_minutes_between": 60
+  },
+  "paid_agents": [
+    "muse_paid"
+  ],
+  "abort_output_re": "level=ERROR .*message=\"stream error\".*(Rate limit|Too Many Requests|insufficient balance|quota)",
+  "abort_after_matches": 1,
+  "coders_free": [
+    "deepseek",
+    "muse"
+  ],
+  "_coders_notes": "Owner 2026-10-18: code on paid Muse (muse_paid) so the single OpenAI window serves only Codex art + QA (art is Codex-only). Fallback: Codex Luna, then free models. Earlier: codex_luna (2026-10-16), originally coders_free.",
+  "supervisor": {
+    "stall_minutes": 40,
+    "lane_idle_minutes": 20,
+    "cooldown_minutes": 45,
+    "agents": [
+      "claude",
+      "codex",
+      "muse_paid"
+    ],
+    "timeout_minutes": 30
+  },
+  "lanes": [
+    {
+      "name": "B",
+      "dir": "C:/Users/<you>/gh_laneB"
+    },
+    {
+      "name": "C",
+      "dir": "C:/Users/<you>/gh_laneC"
+    }
+  ],
+  "background_planning": true,
+  "stop_after_milestone": "M11",
+  "_art_notes": "Owner policy 'Codex for art': asset tasks wait for Codex (image generation) instead of falling back. 2026-10-18: paid Muse, lacking image generation, drew 'painted' enemy portraits procedurally (T-302/T-304/T-305/T-308) and they passed review."
+}

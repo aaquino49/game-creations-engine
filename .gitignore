@@ -1,0 +1,3 @@
+__pycache__/
+*.pyc
+test_harness/fake_godot.cmd
