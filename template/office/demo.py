@@ -20,7 +20,7 @@ def demo_state(scene="auto"):
     clock = dt.datetime.now()
     until = (clock + dt.timedelta(minutes=24)).strftime("%H:%M")
     agents = [{"id": a_id, "label": label, "tool": tool, "model": model, "account": account,
-               "paid": a_id == "coder_1", "coder": a_id == "coder_1"}
+               "paid": a_id == "coder_1", "coder": a_id.startswith("coder_")}
               for a_id, label, tool, model, account in (
         ("quarterback", "Quarterback", "claude", "claude-opus-5-5", "anthropic"),
         ("qa_lead", "QA lead", "codex", "gpt-6.1-sol", "openai"),
@@ -323,15 +323,32 @@ def demo_config():
                                 "meta/muse-spark-1.3-contributor", "{prompt}"],
                         "kind": "opencode", "model": "meta/muse-spark-1.3-contributor",
                         "account": "meta_api", "label": "Coder 1 (paid)"},
+            "coder_2": {"cmd": ["codex", "exec", "-m", "gpt-6-luna",
+                                "--dangerously-bypass-approvals-and-sandbox",
+                                "--skip-git-repo-check", "{prompt}", "{images}"],
+                        "kind": "codex", "model": "gpt-6-luna",
+                        "account": "openai", "label": "Coder 2"},
             "coder_3": {"cmd": ["opencode", "run", "--auto", "-m",
                                 "opencode/beam-free", "{prompt}"],
                         "kind": "opencode", "model": "opencode/beam-free",
                         "account": "coder_3", "label": "Coder 3"},
+            "coder_4": {"cmd": ["opencode", "run", "--auto", "-m",
+                                "opencode/longcat-2.5-preview-free", "{prompt}"],
+                        "kind": "opencode", "model": "opencode/longcat-2.5-preview-free",
+                        "account": "coder_4", "label": "Coder 4"},
+            "coder_5": {"cmd": ["opencode", "run", "--auto", "-m",
+                                "opencode/deepseek-v4.1-flash-free", "{prompt}"],
+                        "kind": "opencode", "model": "opencode/deepseek-v4.1-flash-free",
+                        "account": "coder_5", "label": "Coder 5"},
         },
-        "coders": ["coder_1", "coder_3"],
+        "coders": ["coder_1", "coder_2", "coder_3", "coder_4", "coder_5"],
         "paid_agents": ["coder_1"],
         "roles": {"quarterback": "quarterback", "qa": "qa_lead"},
-        "fallback": {"coder_1:*": ["coder_3"], "coder_3:*": ["coder_1"]},
+        "fallback": {"coder_1:*": ["coder_2", "coder_3", "coder_4", "coder_5"],
+                     "coder_2:*": ["coder_3", "coder_4", "coder_5", "coder_1"],
+                     "coder_3:*": ["coder_2", "coder_4", "coder_5", "coder_1"],
+                     "coder_4:*": ["coder_2", "coder_3", "coder_5", "coder_1"],
+                     "coder_5:*": ["coder_2", "coder_3", "coder_4", "coder_1"]},
         "disabled_agents": ["coder_3"],
         "lanes": [{"name": "B", "dir": "C:/demo/gh_laneB"},
                   {"name": "C", "dir": "C:/demo/gh_laneC"}],
@@ -343,7 +360,9 @@ def demo_config():
     agents = cfg["agents"]
     return {"config": cfg, "mtime": 1729000000.0,
             "models": ["meta/muse-spark-1.3-contributor", "opencode/beam-free",
-                       "gpt-6.1-sol", "claude-opus-5-5"],
+                       "opencode/longcat-2.5-preview-free",
+                       "opencode/deepseek-v4.1-flash-free",
+                       "gpt-6.1-sol", "gpt-6-luna", "claude-opus-5-5"],
             "paid": {n: (n in cfg["paid_agents"]) for n in agents},
             "kinds": {n: agents[n]["kind"] for n in agents}}
 

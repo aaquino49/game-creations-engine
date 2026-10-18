@@ -299,8 +299,8 @@ select, input, textarea { font: inherit; background: var(--panel); color: var(--
 .bcard .bid { font-family: "Departure Mono", ui-monospace, monospace; font-size: 11px; }
 .bcard .bt { font-size: 12px; overflow-wrap: anywhere; }
 .bcard .bm { font-size: 11px; color: var(--muted); }
-.graphwrap { overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); touch-action: none; }
-#graphSvg { width: 100%; height: 420px; display: block; }
+.graphwrap { overflow: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); max-height: 70vh; }
+#graphSvg { width: 100%; height: auto; display: block; }
 .gnode { cursor: pointer; } .gnode text { font-size: 11px; font-family: "Departure Mono", ui-monospace, monospace; }
 .side { min-width: 0; } .panel { min-width: 0; overflow-wrap: anywhere; }
 .ticker li { cursor: default; } .ticker li.hastask { cursor: pointer; }

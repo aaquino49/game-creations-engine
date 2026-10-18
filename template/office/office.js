@@ -1383,10 +1383,49 @@ document.getElementById("addGo").addEventListener("click", e => {
     .then(() => { $d("addModal").hidden = true; });
 });
 // ---- graph
-let graphMsFilter = "", gz = 1, pan = { x: 0, y: 0 };
+let graphMsFilter = "", gz = 1, graphFit = 1, pan = { x: 0, y: 0 };
+const GRAPH_MIN = 9 / 11, GRAPH_MAX = 1.5;
+function computeGraphFit(Wpx, Hpx) {
+  const wrap = document.getElementById("graphWrap");
+  const wrapW = (wrap && wrap.clientWidth) || 600;
+  const vh = window.innerHeight || 800;
+  let fit = wrapW / Wpx;
+  const maxH = vh * 0.7;
+  if (Hpx * fit > maxH) fit = maxH / Hpx;
+  if (fit > GRAPH_MAX) fit = GRAPH_MAX;
+  if (fit < GRAPH_MIN) fit = GRAPH_MIN;
+  return fit;
+}
+function graphEff() {
+  let e = graphFit * gz;
+  if (e > GRAPH_MAX) e = GRAPH_MAX;
+  if (e < GRAPH_MIN) e = GRAPH_MIN;
+  return e;
+}
+function graphZoom(f) {
+  const cur = graphEff();
+  gz = Math.min(GRAPH_MAX, Math.max(GRAPH_MIN, cur * f)) / graphFit;
+  drawGraph();
+}
 $d("graphFilter").addEventListener("change", e => { graphMsFilter = e.target.value; refreshGraph(); });
-document.getElementById("gzIn").addEventListener("click", () => { gz = Math.min(3, gz * 1.2); drawGraph(); });
-document.getElementById("gzOut").addEventListener("click", () => { gz = Math.max(0.3, gz / 1.2); drawGraph(); });
+document.getElementById("gzIn").addEventListener("click", () => graphZoom(1.2));
+document.getElementById("gzOut").addEventListener("click", () => graphZoom(1 / 1.2));
+// Fit button between -/+ resets to the fitted scale (created here so no index.html change).
+try {
+  const outB = document.getElementById("gzOut"), inB = document.getElementById("gzIn");
+  if (outB && inB && !document.getElementById("gzFit")) {
+    const f = document.createElement("button");
+    f.id = "gzFit"; f.type = "button"; f.textContent = "Fit"; f.setAttribute("aria-label", "Reset zoom to fit");
+    f.addEventListener("click", () => { gz = 1; pan = { x: 0, y: 0 }; drawGraph(); });
+    outB.after(f);
+  }
+} catch (e) {}
+window.addEventListener("resize", () => {
+  if (VIEW === "graph" && graphData && graphData.Wpx) {
+    graphFit = computeGraphFit(graphData.Wpx, graphData.Hpx);
+    drawGraph();
+  }
+});
 let graphData = null;
 async function refreshGraph() {
   const b = await fetchBoard();
@@ -1396,6 +1435,8 @@ async function refreshGraph() {
     ...((b.milestones || []).map(m => Object.assign(document.createElement("option"), { value: m, textContent: m }))));
   msSel.value = graphMsFilter;
   graphData = layoutGraph(b);
+  gz = 1; pan = { x: 0, y: 0 };
+  if (graphData && graphData.Wpx) graphFit = computeGraphFit(graphData.Wpx, graphData.Hpx);
   drawGraph();
 }
 function layoutGraph(b) {
@@ -1428,20 +1469,27 @@ function layoutGraph(b) {
     layers.get(l).push(t);
   }
   for (const arr of layers.values()) arr.sort((a, c) => (a.id < c.id ? -1 : 1));
-  return { layers: [...layers.entries()].sort((a, c) => a[0] - c[0]), byId };
+  const _layers = [...layers.entries()].sort((a, c) => a[0] - c[0]);
+  const _maxRows = Math.max(1, ..._layers.map(([, arr]) => arr.length));
+  const Wpx = Math.max(400, _layers.length * 220 + 120), Hpx = Math.max(200, _maxRows * 60 + 80);
+  return { layers: _layers, byId, Wpx, Hpx };
 }
 function drawGraph() {
   const svg = document.getElementById("graphSvg");
+  const wrap = document.getElementById("graphWrap");
   if (!graphData) return;
   const layers = graphData.layers; // Q7: layers laid left→right, nodes stacked vertically per layer
-  const maxRows = Math.max(1, ...layers.map(([, arr]) => arr.length));
-  const Wpx = Math.max(400, layers.length * 220 + 120), Hpx = Math.max(200, maxRows * 60 + 80);
-  svg.setAttribute("viewBox", `0 0 ${Wpx} ${Hpx}`); // Q7: fit-to-width on load
-  if (!drawGraph._fit) { drawGraph._fit = true; gz = Math.min(1, (svg.clientWidth || Wpx) / Wpx) || 1; }
+  const Wpx = graphData.Wpx || Math.max(400, layers.length * 220 + 120);
+  const Hpx = graphData.Hpx || 200;
+  const eff = graphEff();
+  svg.setAttribute("viewBox", `0 0 ${Wpx} ${Hpx}`);
+  svg.style.width = Math.round(Wpx * eff) + "px";
+  svg.style.height = Math.round(Hpx * eff) + "px";
+  svg.style.maxWidth = "none";
   svg.replaceChildren();
   const NS = "http://www.w3.org/2000/svg";
   const g = document.createElementNS(NS, "g");
-  g.setAttribute("transform", `translate(${pan.x},${pan.y}) scale(${gz})`);
+  g.setAttribute("transform", `translate(${pan.x},${pan.y})`);
   svg.appendChild(g);
   const pos = new Map();
   const maxRow = Math.max(1, ...layers.map(([, arr]) => arr.length));
@@ -1494,13 +1542,19 @@ function drawGraph() {
     cg.addEventListener("click", () => openDrawer(id));
     g.appendChild(cg);
   }
-  // pan by dragging
-  if (!svg._panBound) {
-    svg._panBound = true;
+  // drag to scroll the wrapper (the box scrolls when the drawing is taller/wider)
+  if (wrap && !wrap._panBound) {
+    wrap._panBound = true;
     let drag = null;
-    svg.addEventListener("pointerdown", e => { drag = { x: e.clientX, y: e.clientY, ox: pan.x, oy: pan.y }; svg.setPointerCapture(e.pointerId); });
-    svg.addEventListener("pointermove", e => { if (drag) { pan.x = drag.ox + (e.clientX - drag.x); pan.y = drag.oy + (e.clientY - drag.y); drawGraph(); } });
-    svg.addEventListener("pointerup", () => { drag = null; });
+    wrap.addEventListener("pointerdown", e => {
+      if (e.target.closest(".gnode")) return;
+      drag = { x: e.clientX, y: e.clientY, l: wrap.scrollLeft, t: wrap.scrollTop };
+    });
+    wrap.addEventListener("pointermove", e => {
+      if (drag) { wrap.scrollLeft = drag.l - (e.clientX - drag.x); wrap.scrollTop = drag.t - (e.clientY - drag.y); }
+    });
+    wrap.addEventListener("pointerup", () => { drag = null; });
+    wrap.addEventListener("pointercancel", () => { drag = null; });
   }
 }
 // ---- timeline
@@ -1646,6 +1700,15 @@ function svgText(g, x, y, s, attrs) {
 function windowLabel(h) {
   return h === "6" || h === 6 ? "6 h" : h === "72" || h === 72 ? "3 d" : h === "168" || h === 168 ? "7 d" : "24 h";
 }
+function fmtTick(s, hours) {
+  let d = null;
+  try { d = new Date(String(s).replace(" ", "T")); } catch (e) {}
+  if (!d || isNaN(d)) return String(s).slice(5, 13);
+  const hh = d.getHours();
+  if ((+hours || 24) <= 24) return String(hh).padStart(2, "0") + ":00";
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  return days[d.getDay()] + " " + hh + "h";
+}
 let STATS_CACHE = null;
 async function refreshStats() {
   const h = document.getElementById("statsWindow").value || "24";
@@ -1701,7 +1764,8 @@ function paintStats(d) {
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("viewBox", "0 0 520 180"); svg.setAttribute("class", "chart"); svg.setAttribute("role", "img");
     svg.setAttribute("aria-label", "DONE tasks per hour");
-    const wrap = document.createElement("div"); wrap.className = "chartwrap"; wrap.style.maxHeight = "220px"; wrap.style.overflow = "hidden auto"; wrap.appendChild(svg); box.appendChild(wrap);
+    svg.style.maxHeight = "240px"; // cap the height by scaling the whole chart; clipping the wrapper cut off the axes
+    const wrap = document.createElement("div"); wrap.className = "chartwrap"; wrap.appendChild(svg); box.appendChild(wrap);
     const max = Math.max(1, ...tp.buckets.map(b => b.count));
     const n = tp.buckets.length, bw = 460 / Math.max(1, n);
     svgText(svg, 4, 14, "DONE / " + (tp.bucket_hours > 1 ? "6 h" : "hour"), {});
@@ -1717,8 +1781,20 @@ function paintStats(d) {
       const x = 40 + i * bw, y = 150 - bh; // Q1: bars grow up from baseline y=150
       const r = svgEl("rect", { x: x.toFixed(1), y, width: Math.max(1, bw - 2).toFixed(1), height: bh, fill: "var(--accent)" }, svg);
       svgTitle(r, `${b.start}: ${b.count} DONE`);
-      if (i % Math.ceil(n / 6) === 0) svgText(svg, x, 164, b.start.slice(5, 13), {});
     });
+    { // x-axis: y labels keep their own gutter (x<40); first anchored start, last end
+      const tN = Math.min(6, Math.max(1, n));
+      const seen = new Set();
+      for (let k = 0; k < tN; k++) {
+        const i = Math.round(k * (n - 1) / Math.max(1, tN - 1));
+        if (seen.has(i)) continue;
+        seen.add(i);
+        const xc = 40 + i * bw + bw / 2;
+        const anchor = i === 0 ? "start" : i === n - 1 ? "end" : "middle";
+        const xx = i === 0 ? 40 : i === n - 1 ? 500 : xc;
+        svgText(svg, xx, 164, fmtTick(tp.buckets[i].start, d.hours), { "text-anchor": anchor });
+      }
+    }
   }
   cap(`DONE events per ${tp.bucket_hours > 1 ? "6 h" : "hour"} over the last ${wl}.`);
   const bd = d.burndown || { milestones: [], series: [] };
@@ -1751,14 +1827,14 @@ function paintStats(d) {
         svgTitle(c, `${mid} at ${p.t}: ${p.open[mid]} open`);
       });
     });
-    svgText(svg, 40, 176, (bd.series[0] || {}).t ? bd.series[0].t.slice(5, 13) : "", {});
-    { // Q2: 4-6 time ticks on x-axis
+    { // Q2: 4-6 time ticks on x-axis; first anchored start, last end, middle ones middle
       const ticks = Math.min(6, Math.max(4, Math.min(bd.series.length, 5)));
       for (let ti = 0; ti < ticks; ti++) {
         const si = Math.round(ti * (bd.series.length - 1) / Math.max(1, ticks - 1));
         const p = bd.series[si]; if (!p) continue;
         const cx = 40 + si * 460 / Math.max(1, bd.series.length - 1);
-        svgText(svg, cx - 14, 176, (p.t || "").slice(5, 13), {});
+        const anchor = si === 0 ? "start" : si === bd.series.length - 1 ? "end" : "middle";
+        svgText(svg, cx, 176, fmtTick(p.t || "", d.hours), { "text-anchor": anchor });
       }
     }
   }
