@@ -48,6 +48,9 @@ MAX_BODY = 64 * 1024
 _write_lock = threading.Lock()  # serialises read-modify-write of project files
 _probe = {"running": False, "results": {}}
 _probe_lock = threading.Lock()
+_shots: dict = {"t": 0.0, "data": []}
+TASK_ID_RE = re.compile(r"^T-\d+$")
+ALLOWED_SUFFIXES = {".png", ".json", ".log", ".md", ".patch", ".txt"}
 
 
 def process_status(commands: list[str], script: str) -> bool | None:
@@ -308,6 +311,8 @@ def newest_log(folder: Path, step: str | None, agents: dict) -> str | None:
     except OSError:
         return None
     for f in files:
+        if f.name.endswith(".live.log"):
+            continue
         m = re.match(r"^(\w+)\.(\w+)\.log$", f.name)
         if not m or m.group(2) not in agents or (step and m.group(1) != step):
             continue
@@ -345,6 +350,253 @@ def latest_attempt(tid: str) -> Path | None:
     except OSError:
         return None
     return attempts[-1] if attempts else None
+
+
+def lane_log_for(tid: str) -> str | None:
+    """Repo-relative log path for a running task: the .live.log if one exists,
+    otherwise the newest <step>.<agent>.log in the latest attempt, else None."""
+    try:
+        folder = latest_attempt(tid)
+        if not folder:
+            return None
+        try:
+            live = [p for p in folder.glob("*.live.log") if p.is_file()]
+        except OSError:
+            live = []
+        if live:
+            def _mt(p: Path) -> float:
+                try:
+                    return p.stat().st_mtime
+                except OSError:
+                    return -1.0
+            best = max(live, key=_mt)
+            try:
+                return best.relative_to(ROOT).as_posix()
+            except ValueError:
+                return None
+        try:
+            logs = [p for p in folder.glob("*.log")
+                    if p.is_file() and not p.name.endswith(".live.log")
+                    and re.match(r"^(\w+)\.(\w+)\.log$", p.name)]
+        except OSError:
+            logs = []
+        if not logs:
+            return None
+        best = max(logs, key=_mt)
+        try:
+            return best.relative_to(ROOT).as_posix()
+        except ValueError:
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def truncate_strings(obj, limit: int = 4000):
+    """Truncate long strings inside parsed JSON with an ellipsis."""
+    if isinstance(obj, str):
+        return obj[:limit] + "…" if len(obj) > limit else obj
+    if isinstance(obj, dict):
+        return {k: truncate_strings(v, limit) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [truncate_strings(v, limit) for v in obj]
+    return obj
+
+
+def board_summary() -> dict:
+    board = read_json(ROOT / "project" / "board.json") or {}
+    tasks = []
+    for t in board.get("tasks", []):
+        if not isinstance(t, dict):
+            continue
+        tasks.append({
+            "id": t.get("id", ""), "title": t.get("title", ""), "status": t.get("status", ""),
+            "milestone": t.get("milestone", ""), "priority": t.get("priority", 3),
+            "type": t.get("type", ""), "owner": t.get("owner", ""),
+            "depends_on": list(t.get("depends_on", []) or []),
+            "attempts": t.get("attempts", 0),
+        })
+    ms_ids = sorted({t.get("milestone", "") for t in board.get("tasks", []) if t.get("milestone")},
+                    key=lambda m: (int(re.sub(r"\D", "", m) or 0), m))
+    return {"tasks": tasks, "milestones": ms_ids}
+
+
+def task_detail(tid: str) -> dict | None:
+    board = read_json(ROOT / "project" / "board.json") or {}
+    task = next((t for t in board.get("tasks", []) if isinstance(t, dict) and t.get("id") == tid), None)
+    if task is None:
+        return None
+    brief = read(ROOT / "project" / "tasks" / f"{tid}.md")
+    runs_dir = ROOT / "project" / "runs" / tid
+    detailed = []
+    try:
+        sub = sorted((p for p in runs_dir.iterdir() if p.is_dir() and re.match(r"a\d+$", p.name)),
+                     key=lambda p: int(p.name[1:])) if runs_dir.is_dir() else []
+    except OSError:
+        sub = []
+    for folder in sub:
+        n = int(folder.name[1:])
+        files = []
+        try:
+            entries = sorted((p for p in folder.iterdir() if p.is_file()), key=lambda p: p.name)
+        except OSError:
+            entries = []
+        for f in entries:
+            suf = f.suffix.lower()
+            kind = "json" if suf == ".json" else "log" if suf == ".log" else "image" if suf == ".png" \
+                else "patch" if suf == ".patch" else "other"
+            try:
+                size = f.stat().st_size
+            except OSError:
+                size = 0
+            files.append({"name": f.name, "size": size, "kind": kind})
+        work = truncate_strings(read_json(folder / "work.json")) if (folder / "work.json").is_file() else None
+        qa = truncate_strings(read_json(folder / "qa.json")) if (folder / "qa.json").is_file() else None
+        review = truncate_strings(read_json(folder / "review.json")) if (folder / "review.json").is_file() else None
+        detailed.append({"n": n, "files": files, "work": work, "qa": qa, "review": review})
+    out = dict(task)
+    out["attempts_count"] = task.get("attempts", 0)
+    out["brief"] = brief
+    out["attempts"] = detailed
+    return out
+
+
+def resolve_office_file(rel: str) -> Path | None:
+    """Repo-relative path -> resolved Path if inside project/runs or project/tasks
+    with an allowed suffix; otherwise None (403). Beats .., absolute paths, symlinks."""
+    if not isinstance(rel, str) or not rel:
+        return None
+    if re.match(r"^[a-zA-Z]:", rel) or rel.startswith("\\\\") or rel.startswith("/"):
+        return None
+    try:
+        if Path(rel).is_absolute():
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    p = Path(rel)
+    if p.suffix.lower() not in ALLOWED_SUFFIXES:
+        return None
+    try:
+        target = (ROOT / rel).resolve()
+        base_runs = (ROOT / "project" / "runs").resolve()
+        base_tasks = (ROOT / "project" / "tasks").resolve()
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        target.relative_to(base_runs)
+        inside = True
+    except ValueError:
+        try:
+            target.relative_to(base_tasks)
+            inside = True
+        except ValueError:
+            inside = False
+    if not inside:
+        return None
+    return target
+
+
+def screenshots_list() -> list:
+    with _lock:
+        if time.time() - _shots["t"] < 10 and _shots["data"] is not None:
+            return _shots["data"]
+    board = read_json(ROOT / "project" / "board.json") or {}
+    titles = {t.get("id"): t.get("title", "") for t in board.get("tasks", []) if isinstance(t, dict)}
+    runs = ROOT / "project" / "runs"
+    found = []
+    try:
+        paths = list(runs.glob("T-*/a*/*.png")) if runs.is_dir() else []
+    except OSError:
+        paths = []
+    for p in paths:
+        if not p.is_file():
+            continue
+        try:
+            mt = p.stat().st_mtime
+        except OSError:
+            continue
+        try:
+            rel = p.relative_to(ROOT).as_posix()
+        except ValueError:
+            continue
+        parts = p.relative_to(runs).parts
+        task = parts[0] if len(parts) > 0 else ""
+        attempt = parts[1] if len(parts) > 1 else ""
+        found.append({"task": task, "attempt": attempt, "name": p.name, "path": rel,
+                      "t": dt.datetime.fromtimestamp(mt).strftime("%Y-%m-%d %H:%M"),
+                      "title": titles.get(task, ""), "_mt": mt})
+    found.sort(key=lambda e: e.pop("_mt"))
+    with _lock:
+        _shots["t"] = time.time()
+        _shots["data"] = found
+    return found
+
+
+def validate_command(data: dict, board: dict) -> tuple[int, str]:
+    """(code, error). 0 means valid. Mirrors the orchestrator inbox rules."""
+    action = data.get("action", "")
+    if action not in ("set_priority", "set_status", "retry", "add_task"):
+        return 400, "unknown action"
+    if action == "set_priority":
+        tid, prio = data.get("task"), data.get("priority")
+        if not isinstance(tid, str) or prio is None:
+            return 400, "task and priority required"
+        if not TASK_ID_RE.match(tid) or not next((t for t in board.get("tasks", []) if t.get("id") == tid), None):
+            return 400, "unknown task"
+        try:
+            if isinstance(prio, bool):
+                raise ValueError()
+            p = int(prio)
+        except Exception:  # noqa: BLE001
+            return 400, "bad priority"
+        if p < 1 or p > 5:
+            return 400, "bad priority"
+        return 0, ""
+    if action == "set_status":
+        tid, st = data.get("task"), data.get("status")
+        if not isinstance(tid, str) or not isinstance(st, str):
+            return 400, "task and status required"
+        if not TASK_ID_RE.match(tid) or not next((t for t in board.get("tasks", []) if t.get("id") == tid), None):
+            return 400, "unknown task"
+        if st not in ("backlog", "ready", "dropped"):
+            return 400, "bad status"
+        t = next((x for x in board.get("tasks", []) if x.get("id") == tid), {})
+        if t.get("status") in ("in_progress", "done"):
+            return 409, f"task is {t.get('status')}"
+        return 0, ""
+    if action == "retry":
+        tid = data.get("task")
+        if not isinstance(tid, str):
+            return 400, "task required"
+        t = next((x for x in board.get("tasks", []) if x.get("id") == tid), None)
+        if not t or not TASK_ID_RE.match(tid):
+            return 400, "unknown task"
+        if t.get("status") != "blocked":
+            return 409, "only blocked tasks can be retried"
+        return 0, ""
+    spec = data.get("task")
+    if not isinstance(spec, dict):
+        return 400, "task spec required"
+    if not isinstance(spec.get("title"), str) or not spec["title"].strip():
+        return 400, "bad title"
+    if "type" in spec and spec["type"] not in ("code", "asset", "design", "qa"):
+        return 400, "bad type"
+    if "priority" in spec:
+        try:
+            p = spec["priority"]
+            if isinstance(p, bool):
+                raise ValueError()
+            p = int(p)
+            if p < 1 or p > 5:
+                raise ValueError()
+        except Exception:  # noqa: BLE001
+            return 400, "bad priority"
+    if "acceptance" in spec and (not isinstance(spec["acceptance"], list)
+                                 or not all(isinstance(x, str) for x in spec["acceptance"])):
+        return 400, "bad acceptance"
+    if "depends_on" in spec and (not isinstance(spec["depends_on"], list)
+                                 or not all(isinstance(x, str) for x in spec["depends_on"])):
+        return 400, "bad depends_on"
+    return 0, ""
 
 
 def step_of(activity: str) -> str:
@@ -418,10 +670,10 @@ def build_state() -> dict:
     def lane_job(lane: str, task_text: str, activity: str) -> dict:
         m = re.match(r"^(T-\d+)\s+(.*?)(?:\s+\((\w+)\))?$", task_text.strip())
         if not m:
-            return {"lane": lane, "state": "idle", "activity": activity}
+            return {"lane": lane, "state": "idle", "activity": activity, "log": None}
         tid, title = m.group(1), m.group(2)
         if tid in finished and updated and finished[tid] and finished[tid] >= updated:
-            return {"lane": lane, "state": "idle", "activity": "finished " + tid}
+            return {"lane": lane, "state": "idle", "activity": "finished " + tid, "log": None}
         step = step_of(activity)
         agent = agent_from_activity(activity, labels)
         if not agent and step not in ("checks", "merge", "sleeping", "stopped"):
@@ -431,7 +683,7 @@ def build_state() -> dict:
         t = tasks.get(tid, {})
         return {"lane": lane, "state": "busy", "task": tid, "title": title, "step": step, "agent": agent,
                 "type": t.get("type", ""), "owner": t.get("owner", ""), "milestone": t.get("milestone", ""),
-                "attempt": t.get("attempts", 0), "activity": activity}
+                "attempt": t.get("attempts", 0), "activity": activity, "log": lane_log_for(tid)}
 
     now_text = (re.search(r"^\*\*Now:\*\* (.*)$", status, re.M) or [None, ""])[1]
     cur = (re.search(r"^\*\*Current task:\*\* (.*)$", status, re.M) or [None, "-"])[1]
@@ -440,15 +692,15 @@ def build_state() -> dict:
     planner = {"busy": False}
     if "working on plan" in now_text and cur.strip() in ("-", ""):
         planner = {"busy": True, "reason": "", "activity": now_text}
-        lanes["A"] = {"lane": "A", "state": "idle", "activity": "planning"}
+        lanes["A"] = {"lane": "A", "state": "idle", "activity": "planning", "log": None}
     else:
         lanes["A"] = lane_job("A", cur if cur.strip() != "-" else "", now_text)
     for name, text in re.findall(r"^\*\*Lane (\w+):\*\* (.*)$", status, re.M):
         if text.strip() == "idle" or text.strip() == "off":
-            lanes[name] = {"lane": name, "state": "idle", "activity": ""}
+            lanes[name] = {"lane": name, "state": "idle", "activity": "", "log": None}
             continue
         m = re.match(r"^(T-\d+ .*?\(\w+\))(?: - (.*))?$", text)
-        lanes[name] = lane_job(name, m.group(1), m.group(2) or "") if m else {"lane": name, "state": "idle", "activity": text}
+        lanes[name] = lane_job(name, m.group(1), m.group(2) or "") if m else {"lane": name, "state": "idle", "activity": text, "log": None}
     pl = re.search(r"^\*\*Planner:\*\* (.*?)(?: \((.*)\))?$", status, re.M)
     if pl:
         planner = {"busy": True, "activity": pl.group(1), "reason": pl.group(2) or ""}
@@ -459,7 +711,9 @@ def build_state() -> dict:
         jobs.append({"agent": planner["agent"], "station": "plan", "step": "plan", "task": "",
                      "title": planner.get("reason") or "planning the next tasks"})
     for name in lane_names:
-        ln = lanes.get(name) or {"lane": name, "state": "idle"}
+        ln = lanes.get(name) or {"lane": name, "state": "idle", "log": None}
+        if "log" not in ln:
+            ln["log"] = lane_log_for(ln["task"]) if ln.get("state") == "busy" and ln.get("task") else None
         lanes[name] = ln
         if ln["state"] == "busy" and ln.get("agent") and ln.get("step") in ("work", "qa", "review"):
             jobs.append({"agent": ln["agent"], "station": f"lane:{name}", "step": ln["step"], "task": ln["task"],
@@ -584,16 +838,146 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         url = urlsplit(self.path)
         path = unquote(url.path)
+        qs = parse_qs(url.query)
         if path == "/api/state":
             if DEMO:
                 from demo import demo_state
-                scene = parse_qs(url.query).get("scene", ["auto"])[0]
+                scene = qs.get("scene", ["auto"])[0]
                 st = demo_state(scene)
                 st["manage"] = True  # the demo shows the manage UI off
                 return self.send(200, json.dumps(st).encode("utf-8"), "application/json")
             if MANAGE and not host_allowed(self.headers.get("Host", "")):
                 return self.deny(403, "bad host")
             return self.send(200, json.dumps(state()).encode("utf-8"), "application/json")
+        if path == "/api/board":
+            if DEMO:
+                return self.send(200, json.dumps({"tasks": [], "milestones": []}).encode("utf-8"),
+                                  "application/json")
+            if MANAGE and not host_allowed(self.headers.get("Host", "")):
+                return self.deny(403, "bad host")
+            return self.send(200, json.dumps(board_summary()).encode("utf-8"), "application/json")
+        if path.startswith("/api/task/"):
+            if DEMO:
+                return self.deny(404, "unknown task")
+            if MANAGE and not host_allowed(self.headers.get("Host", "")):
+                return self.deny(403, "bad host")
+            tid = path[len("/api/task/"):]
+            if not re.match(r"^T-\d+$", tid):
+                return self.deny(400, "bad task id")
+            detail = task_detail(tid)
+            if detail is None:
+                return self.deny(404, "unknown task")
+            return self.send(200, json.dumps(detail).encode("utf-8"), "application/json")
+        if path == "/api/file":
+            if DEMO:
+                return self.deny(404, "not found")
+            if MANAGE and not host_allowed(self.headers.get("Host", "")):
+                return self.deny(403, "bad host")
+            relp = (qs.get("path", [""])[0] or "")
+            target = resolve_office_file(relp)
+            if target is None:
+                return self.deny(403, "forbidden")
+            if not target.is_file():
+                return self.deny(404, "not found")
+            try:
+                data = target.read_bytes()
+            except OSError:
+                return self.deny(404, "not found")
+            suf = target.suffix.lower()
+            if suf in (".log", ".patch", ".txt", ".md", ".json"):
+                if len(data) > 512 * 1024:
+                    tail = data[-512 * 1024:]
+                    nl = tail.find(b"\n")
+                    data = tail[nl + 1:] if nl >= 0 else tail
+                ctype = "text/plain" if suf in (".log", ".patch", ".txt") else \
+                    "application/json" if suf == ".json" else "text/markdown"
+                return self.send(200, data, ctype)
+            if suf == ".png":
+                return self.send(200, data, "image/png")
+            return self.deny(403, "forbidden")
+        if path == "/api/tail":
+            if DEMO:
+                return self.deny(404, "not found")
+            if MANAGE and not host_allowed(self.headers.get("Host", "")):
+                return self.deny(403, "bad host")
+            relp = (qs.get("path", [""])[0] or "")
+            target = resolve_office_file(relp)
+            if target is None:
+                return self.deny(403, "forbidden")
+            if not target.is_file():
+                return self.deny(404, "not found")
+            off_raw = (qs.get("offset", ["0"])[0] or "0")
+            try:
+                offset = int(off_raw)
+                if offset < 0:
+                    raise ValueError()
+            except ValueError:
+                return self.deny(400, "bad offset")
+            try:
+                size = target.stat().st_size
+            except OSError:
+                return self.deny(404, "not found")
+            if offset > size:
+                offset = 0
+            try:
+                with target.open("rb") as f:
+                    f.seek(offset)
+                    chunk = f.read(64 * 1024)
+            except OSError:
+                return self.deny(404, "not found")
+            if len(chunk) == 64 * 1024:
+                try:
+                    with target.open("rb") as f:
+                        f.seek(offset + len(chunk))
+                        extra = f.read(1)
+                except OSError:
+                    extra = b""
+                if extra:
+                    nl = chunk.rfind(b"\n")
+                    if nl >= 0:
+                        chunk = chunk[:nl + 1]
+            text = chunk.decode("utf-8", errors="replace")
+            done = target.name.endswith(".log") and not target.name.endswith(".live.log")
+            return self.send(200, json.dumps({"text": text, "offset": offset + len(chunk),
+                                                      "size": size, "done": done}).encode("utf-8"),
+                              "application/json")
+        if path == "/api/screenshots":
+            if DEMO:
+                return self.send(200, json.dumps([]).encode("utf-8"), "application/json")
+            if MANAGE and not host_allowed(self.headers.get("Host", "")):
+                return self.deny(403, "bad host")
+            return self.send(200, json.dumps(screenshots_list()).encode("utf-8"), "application/json")
+        if path == "/api/commands":
+            if DEMO:
+                return self.send(200, json.dumps({"pending": [], "done": []}).encode("utf-8"),
+                                  "application/json")
+            if not self.check_manage():
+                return
+            cmd_dir = ROOT / "project" / "commands"
+            done_dir = cmd_dir / "done"
+            pending = []
+            try:
+                files = sorted((p for p in cmd_dir.glob("*.json") if p.is_file()), key=lambda p: p.name)
+            except OSError:
+                files = []
+            for p in files:
+                try:
+                    pending.append(json.loads(p.read_text(encoding="utf-8")))
+                except Exception:  # noqa: BLE001
+                    pending.append({"id": p.stem, "action": "?", "malformed": True})
+            done = []
+            try:
+                dfiles = sorted((p for p in done_dir.glob("*.json") if p.is_file()),
+                                key=lambda p: p.name, reverse=True)[:20] if done_dir.is_dir() else []
+            except OSError:
+                dfiles = []
+            for p in dfiles:
+                try:
+                    done.append(json.loads(p.read_text(encoding="utf-8")))
+                except Exception:  # noqa: BLE001
+                    continue
+            return self.send(200, json.dumps({"pending": pending, "done": done}).encode("utf-8"),
+                              "application/json")
         if path in ("/api/requests", "/api/probe"):
             if DEMO:
                 stub = {"open": [], "handled": []} if path == "/api/requests" else {"running": False, "results": {}}
@@ -643,7 +1027,36 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_probe_post()
         if path == "/api/notify-test":
             return self.handle_notify_post()
+        if path == "/api/command":
+            return self.handle_command_post(data)
         return self.deny(404, "unknown endpoint")
+
+    def handle_command_post(self, data: dict) -> None:
+        board = read_json(ROOT / "project" / "board.json") or {}
+        code, err = validate_command(data, board)
+        if code:
+            return self.deny(code, err)
+        cmd_dir = ROOT / "project" / "commands"
+        try:
+            cmd_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return self.deny(500, "cannot write commands") if hasattr(self, "deny") else None
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        cid = f"{stamp}-{secrets.token_hex(3)}"
+        payload = {"id": cid, "at": dt.datetime.now().isoformat(timespec="seconds"),
+                   "source": "office", **data}
+        # id in the body (if any) must not override the generated one
+        payload["id"] = cid
+        text = json.dumps(payload, indent=2)
+        try:
+            with _write_lock:
+                tmp = cmd_dir / (cid + ".json.tmp")
+                tmp.write_text(text, encoding="utf-8")
+                os.replace(tmp, cmd_dir / (cid + ".json"))
+        except OSError:
+            return self.deny(500, "cannot write commands")
+        invalidate()
+        self.send(200, json.dumps({"ok": True, "id": cid}).encode("utf-8"), "application/json")
 
     def handle_control(self, data: dict) -> None:
         action = data.get("action", "")

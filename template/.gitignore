@@ -9,6 +9,7 @@ project/runs/
 project/STATUS.md
 project/events.log
 project/STOP
+project/commands/
 __pycache__/
 
 # Builds

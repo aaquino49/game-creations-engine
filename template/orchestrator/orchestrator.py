@@ -309,10 +309,31 @@ def run_proc(args: list[str], timeout_s: float, log_path: Path | None = None,
     abort_after = int(CONFIG.get("abort_after_matches", 3))
     chunks: list[bytes] = []
     hits = {"n": 0}
+    live_path = log_path.with_name(log_path.stem + ".live.log") if log_path else None
+    live_f = None
+    if live_path:
+        try:
+            live_path.parent.mkdir(parents=True, exist_ok=True)
+            live_f = live_path.open("w", encoding="utf-8", errors="replace")
+            live_f.write(f"$ {' '.join(args)}\n(running)\n\n")
+            live_f.flush()
+        except Exception:  # noqa: BLE001 - live logs must never break an agent call
+            try:
+                if live_f:
+                    live_f.close()
+            except Exception:  # noqa: BLE001
+                pass
+            live_f = None
 
     def reader() -> None:
         for line in iter(proc.stdout.readline, b""):
             chunks.append(line)
+            if live_f is not None:
+                try:
+                    live_f.write(ANSI_RE.sub("", line.decode("utf-8", errors="replace")))
+                    live_f.flush()
+                except Exception:  # noqa: BLE001
+                    pass
             if abort_re and abort_re.search(line.decode("utf-8", errors="replace")):
                 hits["n"] += 1
                 if hits["n"] == abort_after:
@@ -335,6 +356,16 @@ def run_proc(args: list[str], timeout_s: float, log_path: Path | None = None,
     if log_path:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(f"$ {' '.join(args)}\n(rc={proc.returncode}, timed_out={timed_out})\n\n{out}", encoding="utf-8")
+    if live_f is not None:
+        try:
+            live_f.close()
+        except Exception:  # noqa: BLE001
+            pass
+    if live_path:
+        try:
+            live_path.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
     return proc.returncode, out, timed_out
 
 
@@ -1436,6 +1467,10 @@ def run_task(board: dict, task: dict, lane: str = "A") -> str:
 def recover(board: dict, lanes: tuple | None = None) -> None:
     """Reset any task interrupted mid-flight (crash / window closed / stop) so it restarts cleanly.
     Each lane's unfinished work is saved (patch + file copies) before its checkout is reset."""
+    try:
+        (PROJECT / "commands" / "done").mkdir(parents=True, exist_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
     lanes = lanes or ("A", *WORKTREE_LANES)
     interrupted = [t for t in board["tasks"] if t["status"] == "in_progress" and t.get("lane", "A") in lanes]
     by_root: dict[Path, list[dict]] = {ROOT: []}
@@ -1735,6 +1770,246 @@ def start_plan_now_watcher(board: dict) -> None:
     threading.Thread(target=watch, daemon=True, name="plan-now").start()
 
 
+def process_commands(board: dict) -> None:
+    """One inbox pass: apply project/commands/*.json oldest first (by name).
+
+    Factored out so tests can call it directly. Never raises: malformed files
+    and per-file errors are moved to done/ with a refused result and logged.
+    """
+    cmd_dir = PROJECT / "commands"
+    done_dir = cmd_dir / "done"
+    try:
+        done_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        files = sorted((p for p in cmd_dir.glob("*.json") if p.is_file()), key=lambda p: p.name)
+    except Exception as e:  # noqa: BLE001
+        event(f"COMMAND watcher error: {e!r}"[:200])
+        return
+    for path in files:
+        try:
+            _process_command_file(board, path, done_dir)
+        except Exception as e:  # noqa: BLE001 - never fatal
+            event(f"COMMAND watcher error: {e!r}"[:200])
+
+
+def _finish_command(path: Path, done_dir: Path, data: dict | None, raw_text: str | None,
+                    cid: str, action: str, task_label: str, result: str) -> None:
+    try:
+        done_dir.mkdir(parents=True, exist_ok=True)
+        if isinstance(data, dict):
+            data = dict(data)
+        else:
+            data = {"raw": (raw_text or "")[:2000]} if raw_text else {}
+            if cid:
+                data["id"] = cid
+            if action:
+                data["action"] = action
+        data["result"] = result
+        data["done_at"] = now()
+        (done_dir / path.name).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as e:  # noqa: BLE001
+        event(f"COMMAND watcher error: {e!r}"[:200])
+        return
+    try:
+        event(f"COMMAND {cid} {action} {task_label} {result}"[:300])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _process_command_file(board: dict, path: Path, done_dir: Path) -> None:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        event(f"COMMAND watcher error: {e!r}"[:200])
+        return
+    try:
+        data = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        _finish_command(path, done_dir, None, raw, path.stem, "?", "new", "refused: malformed")
+        return
+    if not isinstance(data, dict):
+        _finish_command(path, done_dir, None, raw, path.stem, "?", "new", "refused: malformed")
+        return
+    cid = data.get("id")
+    action = data.get("action")
+    if not isinstance(cid, str) or not cid or not isinstance(action, str) or not action:
+        _finish_command(path, done_dir, data, raw, str(cid) if cid else path.stem,
+                        str(action) if isinstance(action, str) and action else "?",
+                        "new", "refused: malformed")
+        return
+    if action not in ("set_priority", "set_status", "retry", "add_task"):
+        _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
+        return
+    # Missing required keys -> malformed; bad values -> refused.
+    if action in ("set_priority", "set_status", "retry") and "task" not in data:
+        _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
+        return
+    if action == "set_priority" and "priority" not in data:
+        _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
+        return
+    if action == "set_status" and "status" not in data:
+        _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
+        return
+    if action == "add_task" and "task" not in data:
+        _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
+        return
+
+    if action == "set_priority":
+        tid = data.get("task")
+        prio = data.get("priority")
+        if not isinstance(tid, str):
+            _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
+            return
+        t = task_by_id(board, tid)
+        if not t:
+            _finish_command(path, done_dir, data, raw, cid, action, tid, "refused: unknown task")
+            return
+        try:
+            if isinstance(prio, bool):
+                raise ValueError()
+            p = int(prio)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001
+            _finish_command(path, done_dir, data, raw, cid, action, tid, "refused: bad priority")
+            return
+        if p < 1 or p > 5:
+            _finish_command(path, done_dir, data, raw, cid, action, tid, "refused: bad priority")
+            return
+        apply_plan(board, {"update_tasks": [{"id": tid, "priority": p}]})
+        try:
+            git_commit(f"OWNER: set {tid} priority to {p}", paths=["project"])
+        except Exception:  # noqa: BLE001
+            pass
+        _finish_command(path, done_dir, data, raw, cid, action, tid, "applied")
+        return
+
+    if action == "set_status":
+        tid = data.get("task")
+        st = data.get("status")
+        if not isinstance(tid, str):
+            _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
+            return
+        if st not in ("backlog", "ready", "dropped"):
+            if "status" not in data or not isinstance(st, str):
+                _finish_command(path, done_dir, data, raw, cid, action, tid, "refused: malformed")
+            else:
+                _finish_command(path, done_dir, data, raw, cid, action, tid, "refused: bad status")
+            return
+        t = task_by_id(board, tid)
+        if not t:
+            _finish_command(path, done_dir, data, raw, cid, action, tid, "refused: unknown task")
+            return
+        with BOARD_LOCK:  # check + apply atomically: a lane may claim the task in between
+            busy = t.get("status") in ("in_progress", "done")
+            if not busy:
+                apply_plan(board, {"update_tasks": [{"id": tid, "status": st}]})
+        if busy:
+            _finish_command(path, done_dir, data, raw, cid, action, tid,
+                            f"refused: task is {t.get('status')}")
+            return
+        try:
+            git_commit(f"OWNER: set {tid} status to {st}", paths=["project"])
+        except Exception:  # noqa: BLE001
+            pass
+        _finish_command(path, done_dir, data, raw, cid, action, tid, "applied")
+        return
+
+    if action == "retry":
+        tid = data.get("task")
+        if not isinstance(tid, str):
+            _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
+            return
+        t = task_by_id(board, tid)
+        if not t:
+            _finish_command(path, done_dir, data, raw, cid, action, tid, "refused: unknown task")
+            return
+        with BOARD_LOCK:
+            blocked = t.get("status") == "blocked"
+            if blocked:
+                apply_plan(board, {"promote": [tid]})
+        if not blocked:
+            _finish_command(path, done_dir, data, raw, cid, action, tid,
+                            "refused: only blocked tasks can be retried")
+            return
+        try:
+            git_commit(f"OWNER: retry {tid}", paths=["project"])
+        except Exception:  # noqa: BLE001
+            pass
+        _finish_command(path, done_dir, data, raw, cid, action, tid, "applied")
+        return
+
+    # add_task
+    spec = data.get("task")
+    if not isinstance(spec, dict):
+        _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
+        return
+    title = spec.get("title")
+    if not isinstance(title, str) or not title.strip():
+        _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: bad title")
+        return
+    typ = spec.get("type", "code")
+    if typ not in ("code", "asset", "design", "qa"):
+        _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: bad type")
+        return
+    if "priority" in spec:
+        try:
+            p = spec["priority"]
+            if isinstance(p, bool):
+                raise ValueError()
+            p = int(p)
+            if p < 1 or p > 5:
+                raise ValueError()
+        except Exception:  # noqa: BLE001
+            _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: bad priority")
+            return
+    if "acceptance" in spec and (not isinstance(spec["acceptance"], list)
+                                 or not all(isinstance(x, str) for x in spec["acceptance"])):
+        _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: bad acceptance")
+        return
+    if "depends_on" in spec and (not isinstance(spec["depends_on"], list)
+                                 or not all(isinstance(x, str) for x in spec["depends_on"])):
+        _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: bad depends_on")
+        return
+    before = {t["id"] for t in board.get("tasks", [])}
+    apply_plan(board, {"new_tasks": [spec]})
+    new_tasks = [t for t in board.get("tasks", []) if t["id"] not in before]
+    new_id = new_tasks[-1]["id"] if new_tasks else "new"
+    if new_tasks:
+        try:
+            with BOARD_LOCK:
+                new_tasks[-1]["source"] = "owner"
+            save_board(board)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        git_commit(f"OWNER: add task {new_id}", paths=["project"])
+    except Exception:  # noqa: BLE001
+        pass
+    _finish_command(path, done_dir, data, raw, cid, action, new_id, "applied")
+
+
+def start_command_watcher(board: dict) -> None:
+    """Office inbox: apply project/commands/*.json every 5 s (oldest first). Never fatal."""
+
+    def watch() -> None:
+        while not _drain.is_set():
+            time.sleep(5)
+            try:
+                process_commands(board)
+            except Exception as e:  # noqa: BLE001 - the watcher must never take the orchestrator down
+                try:
+                    event(f"COMMAND watcher error: {e!r}"[:200])
+                except Exception:  # noqa: BLE001
+                    pass
+
+    threading.Thread(target=watch, daemon=True, name="commands").start()
+
+
 def run_loop(board: dict, args) -> int:
     need_plan = "first run of this session" if not args.once else None
     empty_plans = 0
@@ -1743,6 +2018,7 @@ def run_loop(board: dict, args) -> int:
         start_lanes(board)
         if background:
             start_plan_now_watcher(board)
+        start_command_watcher(board)
     while True:
         check_stop()
         restart_flag = PROJECT / "RESTART"

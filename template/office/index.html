@@ -13,7 +13,28 @@
     <span class="game" id="game">The Office</span>
     <span class="sub" id="subtitle">the AI team, live</span>
   </div>
+  <nav class="views" aria-label="Views">
+    <button id="viewOffice" type="button" class="vbtn on" aria-pressed="true">Office</button>
+    <button id="viewBoard" type="button" class="vbtn" aria-pressed="false">Board</button>
+    <button id="viewGraph" type="button" class="vbtn" aria-pressed="false">Graph</button>
+    <button id="btnTimeline" type="button">Timeline</button>
+  </nav>
   <div class="pills">
+    <label id="demoControl" hidden>Preview
+      <select id="scene" aria-label="Preview scene">
+        <option value="auto">Auto tour</option>
+        <option value="working">At work</option>
+        <option value="checks">Tests &amp; merges</option>
+        <option value="idle">Coffee break</option>
+        <option value="limits">Usage limits</option>
+        <option value="complete">Project complete</option>
+        <option value="closed">Office closed</option>
+      </select>
+    </label>
+    <span class="pill" id="pill">connecting…</span>
+    <span class="counts" id="counts"></span>
+    <span class="clock" id="clock"></span>
+  </div>
     <label id="demoControl" hidden>Preview
       <select id="scene" aria-label="Preview scene">
         <option value="auto">Auto tour</option>
@@ -46,6 +67,21 @@
       <div class="banner" id="banner" role="status" hidden></div>
     </div>
     <p class="hint" id="hint">Hover or tap a worker or lane plate for details; click to pin it. Closing this window never affects the team.</p>
+    <section class="panel boardview" id="boardView" hidden>
+      <div class="row btns">
+        <label>Milestone <select id="boardFilter" aria-label="Milestone filter"><option value="">All</option></select></label>
+        <button id="btnAddTask" type="button" hidden>+ Add task</button>
+      </div>
+      <div class="boardcols" id="boardCols"></div>
+    </section>
+    <section class="panel graphview" id="graphView" hidden>
+      <div class="row btns">
+        <label>Milestone <select id="graphFilter" aria-label="Milestone filter"><option value="">All</option></select></label>
+        <button id="gzOut" type="button" aria-label="Zoom out">−</button>
+        <button id="gzIn" type="button" aria-label="Zoom in">+</button>
+      </div>
+      <div class="graphwrap" id="graphWrap"><svg id="graphSvg" role="img" aria-label="Task dependency graph"></svg></div>
+    </section>
   </section>
 
   <aside class="side">
@@ -88,6 +124,74 @@
 </main>
 
 <div class="toast" id="toast" role="status" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-label="Task drawer">
+  <div class="dhead">
+    <button id="drawerX" type="button" aria-label="Close">✕</button>
+    <div class="did"><span id="dId"></span> <span id="dStatus"></span> <span id="dPending" class="chip pend" hidden>⏳ pending</span></div>
+    <div class="dtitle" id="dTitle"></div>
+    <div class="dmeta" id="dMeta"></div>
+    <div class="ddeps" id="dDeps"></div>
+    <div class="dactions" id="dActions" hidden>
+      <label>Priority <select id="dPrio"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></label>
+      <label>Status <select id="dStatusSel"><option value="backlog">Backlog</option><option value="ready">Ready</option><option value="dropped">Dropped</option></select></label>
+      <button id="dRetry" type="button" hidden>Retry</button>
+      <button id="dDrop" type="button">Drop</button>
+    </div>
+    <nav class="dtabs" id="dTabs">
+      <button data-tab="live" type="button" id="tabLive" hidden>Live</button>
+      <button data-tab="brief" type="button" class="on">Brief</button>
+      <button data-tab="accept" type="button">Acceptance</button>
+      <button data-tab="attempts" type="button">Attempts</button>
+    </nav>
+  </div>
+  <div class="dbody" id="dBody">
+    <div class="dpane" id="paneLive" hidden>
+      <div class="livewrap"><pre id="livePre" class="livepre"></pre><button id="liveNew" class="pill newout" hidden type="button">↓ new output</button></div>
+      <div id="liveDone" class="muted" hidden>finished</div>
+    </div>
+    <div class="dpane" id="paneBrief"><pre id="dBrief" class="prewrap"></pre></div>
+    <div class="dpane" id="paneAccept" hidden><ul id="dAccept" class="acclist"></ul></div>
+    <div class="dpane" id="paneAttempts" hidden><div id="dAttempts"></div></div>
+    <div class="dpane filepane" id="paneFile" hidden>
+      <button id="fileBack" type="button">← Back</button>
+      <div id="fileName" class="muted"></div>
+      <pre id="filePre" class="prewrap"></pre>
+    </div>
+  </div>
+</aside>
+<div class="modal" id="timeModal" hidden>
+  <div class="mbox">
+    <div class="row btns"><strong>Timeline</strong>
+      <label>Milestone <select id="timeFilter"><option value="">All</option></select></label>
+      <span class="sp"></span><button id="timeX" type="button">✕</button>
+    </div>
+    <div id="timeEmpty" class="muted">No screenshots yet.</div>
+    <div id="timeMain" hidden>
+      <img id="timeImg" alt="Screenshot timeline">
+      <button id="timeCap" type="button" class="cap"></button>
+      <div class="row btns">
+        <button id="timePrev" type="button">◀</button>
+        <input id="timeRange" type="range" min="0" max="0" value="0" aria-label="Screenshot">
+        <button id="timeNext" type="button">▶</button>
+        <button id="timePlay" type="button">▶ Play</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="modal" id="addModal" hidden>
+  <div class="mbox small">
+    <div class="row btns"><strong>+ Add task</strong><span class="sp"></span><button id="addX" type="button">✕</button></div>
+    <label>Title <input id="addTitle"></label>
+    <label>Description <textarea id="addDesc" rows="3"></textarea></label>
+    <label>Milestone <select id="addMs"></select></label>
+    <label>Type <select id="addType"><option value="code">code</option><option value="asset">asset</option><option value="design">design</option><option value="qa">qa</option></select></label>
+    <label>Priority <select id="addPrio"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select></label>
+    <label>Acceptance (one per line) <textarea id="addAcc" rows="3"></textarea></label>
+    <label>Depends on <select id="addDeps" multiple size="5"></select></label>
+    <div class="row btns"><button id="addGo" type="button">Add task</button></div>
+  </div>
+</div>
+<div class="modal" id="lightbox" hidden><img id="lightImg" alt="Screenshot enlarged"></div>
 <script src="office.js"></script>
 </body>
 </html>

@@ -805,6 +805,8 @@ loaded.then(() => { poll(); requestAnimationFrame(frame); }).catch(error => {
 
 // ------------------------------------------------------------------ manage mode (controls, requests, health)
 
+// Deep links (?view=board|graph, ?task=T-12), captured before the token is stripped from the address bar.
+const DEEP = new URLSearchParams(location.search);
 let OFFICE_TOKEN = new URLSearchParams(location.search).get("token") || "";
 try {
   if (OFFICE_TOKEN) sessionStorage.setItem("officeToken", OFFICE_TOKEN);
@@ -952,3 +954,612 @@ function wireManage() {
   $("btnNotify").addEventListener("click", e => runAction(e.target, "api/notify-test", {}));
 }
 wireManage();
+
+// ------------------------------------------------------------------ phase 2: views, drawer, timeline, board/graph, actions
+let VIEW = "office";
+try { VIEW = localStorage.getItem("officeView") || "office"; } catch (e) {}
+if (["office", "board", "graph"].includes(DEEP.get("view"))) VIEW = DEEP.get("view");
+function setView(v) {
+  VIEW = v;
+  try { localStorage.setItem("officeView", v); } catch (e) {}
+  for (const [id, name] of [["viewOffice", "office"], ["viewBoard", "board"], ["viewGraph", "graph"]]) {
+    const b = document.getElementById(id);
+    b.classList.toggle("on", VIEW === name);
+    b.setAttribute("aria-pressed", VIEW === name ? "true" : "false");
+  }
+  document.getElementById("stage").style.display = VIEW === "office" ? "" : "none";
+  document.getElementById("hint").style.display = VIEW === "office" ? "" : "none";
+  document.getElementById("boardView").hidden = VIEW !== "board";
+  document.getElementById("graphView").hidden = VIEW !== "graph";
+  if (VIEW === "board") refreshBoard();
+  if (VIEW === "graph") refreshGraph();
+}
+document.getElementById("viewOffice").addEventListener("click", () => setView("office"));
+document.getElementById("viewBoard").addEventListener("click", () => setView("board"));
+document.getElementById("viewGraph").addEventListener("click", () => setView("graph"));
+
+let BOARD_CACHE = null, CMD_CACHE = { pending: [], done: [] };
+async function fetchBoard() {
+  try {
+    const r = await fetch("api/board", { cache: "no-store" });
+    if (r.ok) BOARD_CACHE = await r.json();
+  } catch (e) {}
+  return BOARD_CACHE;
+}
+async function fetchCommands() {
+  if (!STATE || !STATE.manage) return CMD_CACHE;
+  try {
+    const r = await api("api/commands", { cache: "no-store" });
+    if (r.ok) CMD_CACHE = await r.json();
+  } catch (e) {}
+  return CMD_CACHE;
+}
+function pendingTasks() {
+  const s = new Set();
+  for (const c of (CMD_CACHE.pending || [])) {
+    if (c && typeof c.task === "string" && /^T-\d+$/.test(c.task)) s.add(c.task);
+  }
+  return s;
+}
+setInterval(async () => {
+  await fetchCommands();
+  if (VIEW === "board") refreshBoard(true);
+  if (drawerTask) markPending();
+  // stale command toast: pending >90s while orchestrator running
+  if (STATE && STATE.orchestrator && (CMD_CACHE.pending || []).length) {
+    const now = Date.now();
+    for (const c of CMD_CACHE.pending) {
+      const at = Date.parse(c.at || "");
+      if (at && now - at > 90000 && !fetchCommands._warned) {
+        fetchCommands._warned = true;
+        toast("The orchestrator isn't picking up commands; it may be older than 1.2. Sync it from the engine.");
+        break;
+      }
+    }
+  } else fetchCommands._warned = false;
+}, 10000);
+
+// ---- drawer
+let drawerTask = null, drawerTab = "brief", drawerTimer = 0, liveTimer = 0, liveOffset = 0, livePath = null, liveDone = false;
+const $d = id => document.getElementById(id);
+function openDrawer(tid, tab) {
+  if (!/^T-\d+$/.test(tid)) return;
+  drawerTask = tid;
+  // default tab: Live if running with a log, else keep/brief
+  let lane = STATE && STATE.lanes ? STATE.lanes.find(l => l.task === tid && l.log) : null;
+  drawerTab = tab || (lane ? "live" : (drawerTab === "live" ? "brief" : drawerTab));
+  $d("drawer").hidden = false;
+  clearInterval(drawerTimer);
+  drawerTimer = setInterval(() => { if (drawerTask) loadDrawer(true); }, 5000);
+  loadDrawer(false);
+}
+function closeDrawer() {
+  drawerTask = null;
+  $d("drawer").hidden = true;
+  clearInterval(drawerTimer); clearInterval(liveTimer);
+}
+$d("drawerX").addEventListener("click", closeDrawer);
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") {
+    if (!$d("lightbox").hidden) $d("lightbox").hidden = true;
+    else if (!$d("timeModal").hidden) $d("timeModal").hidden = true;
+    else if (!$d("addModal").hidden) $d("addModal").hidden = true;
+    else if (!$d("drawer").hidden) closeDrawer();
+  }
+  if (!$d("timeModal").hidden) {
+    if (e.key === "ArrowRight") timeStep(1);
+    if (e.key === "ArrowLeft") timeStep(-1);
+  }
+});
+$d("dTabs").addEventListener("click", e => {
+  const b = e.target.closest("button[data-tab]");
+  if (!b) return;
+  drawerTab = b.dataset.tab;
+  paintTabs(); showPane();
+  if (drawerTab === "live") startLive(true);
+});
+function paintTabs() {
+  for (const b of $d("dTabs").querySelectorAll("button")) b.classList.toggle("on", b.dataset.tab === drawerTab);
+}
+function showPane() {
+  $d("paneLive").hidden = drawerTab !== "live";
+  $d("paneBrief").hidden = drawerTab !== "brief";
+  $d("paneAccept").hidden = drawerTab !== "accept";
+  $d("paneAttempts").hidden = drawerTab !== "attempts";
+  $d("paneFile").hidden = true;
+  if (drawerTab !== "live") { $d("paneLive").hidden = true; }
+  else { $d("paneBrief").hidden = $d("paneAccept").hidden = $d("paneAttempts").hidden = true; }
+}
+async function loadDrawer(keepScroll) {
+  if (!drawerTask) return;
+  const sc = $d("dBody").scrollTop;
+  let data;
+  try {
+    const r = await fetch("api/task/" + encodeURIComponent(drawerTask), { cache: "no-store" });
+    if (!r.ok) { if (r.status === 404) { toast("Task not found"); closeDrawer(); } return; }
+    data = await r.json();
+  } catch (e) { return; }
+  paintDrawer(data);
+  if (keepScroll) $d("dBody").scrollTop = sc;
+  markPending();
+  // live tab visibility
+  const lane = STATE && STATE.lanes ? STATE.lanes.find(l => l.task === drawerTask) : null;
+  const hasLog = !!(lane && lane.log);
+  $d("tabLive").hidden = !hasLog;
+  if (hasLog && drawerTab === "live") startLive(false);
+  else if (!hasLog && drawerTab === "live") { drawerTab = "brief"; paintTabs(); showPane(); }
+}
+function paintDrawer(d) {
+  $d("dId").textContent = d.id || drawerTask;
+  const st = document.createElement("span");
+  st.className = "badge st st-" + (d.status || "");
+  st.textContent = d.status || "";
+  $d("dStatus").replaceChildren(st);
+  $d("dTitle").textContent = d.title || "";
+  $d("dMeta").textContent = `milestone ${d.milestone || ""} · type ${d.type || ""} · owner ${d.owner || ""} · priority ${d.priority ?? ""} · attempts ${d.attempts_count ?? (Array.isArray(d.attempts) ? d.attempts.length : d.attempts ?? 0)}`;
+  $d("dDeps").replaceChildren(...(d.depends_on || []).map(id => {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "depchip"; b.textContent = id;
+    b.addEventListener("click", () => openDrawer(id));
+    return b;
+  }));
+  $d("dBrief").textContent = d.brief || "(no brief)";
+  $d("dAccept").replaceChildren(...(d.acceptance || []).map(a => {
+    const li = document.createElement("li"); li.textContent = a; return li;
+  }));
+  if (!(d.acceptance || []).length) $d("dAccept").replaceChildren(Object.assign(document.createElement("li"), { textContent: "No acceptance criteria.", className: "muted" }));
+  // attempts
+  const box = $d("dAttempts");
+  const histByN = new Map((d.history || []).map(h => [h.attempt, h]));
+  box.replaceChildren(...(d.attempts || []).map(a => {
+    const h = histByN.get(a.n) || {};
+    const det = document.createElement("details");
+    det.className = "acard"; det.open = (d.attempts || []).length <= 3;
+    const sum = document.createElement("summary");
+    sum.textContent = `Attempt ${a.n} · ${h.worker || a.worker || (a.work && a.work.worker) || ""} ${verdicts(a, h)}`;
+    det.appendChild(sum);
+    const badges = document.createElement("div");
+    const rows = [["work", (a.work && a.work.status) || h.work], ["checks", h.checks],
+      ["QA", (a.qa && a.qa.verdict) || h.qa], ["review", (a.review && a.review.verdict) || h.review]];
+    for (const [k, v] of rows) {
+      if (v === undefined || v === null || v === "" || v === "?") continue;
+      const s = document.createElement("span"); s.className = "abadge " + (/pass|approve|done|ok|true/i.test(String(v)) ? "ok" : "bad");
+      s.textContent = `${k}: ${v}`; badges.append(" ", s);
+    }
+    det.appendChild(badges);
+    if (a.review && a.review.summary) {
+      const p = document.createElement("p"); p.textContent = "Review: " + a.review.summary; det.appendChild(p);
+    }
+    const bugs = (a.qa && (a.qa.bugs || a.qa.out_of_scope_bugs)) || [];
+    if (bugs.length) {
+      const ul = document.createElement("ul");
+      for (const b of bugs.slice(0, 20)) {
+        const li = document.createElement("li"); li.textContent = (b.title || JSON.stringify(b)).slice(0, 200); ul.appendChild(li);
+      }
+      det.appendChild(ul);
+    }
+    const thumbs = document.createElement("div"); thumbs.className = "thumbs";
+    for (const f of (a.files || []).filter(f => f.kind === "image")) {
+      const img = document.createElement("img");
+      img.src = "api/file?path=" + encodeURIComponent(fileRepoPath(d.id, a.n, f.name));
+      img.alt = f.name; img.loading = "lazy";
+      img.addEventListener("click", () => { $d("lightImg").src = img.src; $d("lightbox").hidden = false; });
+      thumbs.appendChild(img);
+    }
+    det.appendChild(thumbs);
+    for (const f of (a.files || []).filter(f => f.kind === "log" || f.kind === "patch" || f.kind === "json")) {
+      const b = document.createElement("button");
+      b.type = "button"; b.className = "flink"; b.textContent = "📄 " + f.name;
+      b.addEventListener("click", () => openFile(d.id, a.n, f.name));
+      det.appendChild(b); det.appendChild(document.createElement("br"));
+    }
+    return det;
+  }));
+  if (!(d.attempts || []).length) box.textContent = "No attempts yet.";
+  // manage actions
+  const manage = !!(STATE && STATE.manage);
+  $d("dActions").hidden = !manage;
+  if (manage) {
+    $d("dPrio").value = String(d.priority ?? 3);
+    $d("dStatusSel").value = ["backlog", "ready", "dropped"].includes(d.status) ? d.status : "backlog";
+    const busy = d.status === "in_progress" || d.status === "done";
+    $d("dStatusSel").disabled = busy;
+    $d("dRetry").hidden = d.status !== "blocked";
+  }
+  paintTabs(); showPane();
+}
+function verdicts(a, h) {
+  h = h || {};
+  const parts = [];
+  if ((a.work && a.work.status) || h.work) parts.push((a.work && a.work.status) || h.work);
+  if ((a.qa && a.qa.verdict) || h.qa) parts.push("QA " + ((a.qa && a.qa.verdict) || h.qa));
+  if ((a.review && a.review.verdict) || h.review) parts.push((a.review && a.review.verdict) || h.review);
+  return parts.length ? "· " + parts.join(" · ") : "";
+}
+function fileRepoPath(tid, n, name) {
+  return `project/runs/${tid}/a${n}/${name}`;
+}
+async function openFile(tid, n, name) {
+  const p = fileRepoPath(tid, n, name);
+  let text = "";
+  try {
+    const r = await fetch("api/file?path=" + encodeURIComponent(p), { cache: "no-store" });
+    text = await r.text();
+  } catch (e) { text = "(could not load)"; }
+  $d("paneBrief").hidden = $d("paneAccept").hidden = $d("paneAttempts").hidden = $d("paneLive").hidden = true;
+  $d("paneFile").hidden = false;
+  $d("fileName").textContent = p;
+  const pre = $d("filePre");
+  pre.replaceChildren();
+  const isPatch = name.endsWith(".patch");
+  for (const line of text.slice(0, 20000).split("\n")) {
+    const div = document.createElement("div");
+    div.textContent = line;
+    if (isPatch) {
+      if (line.startsWith("+") && !line.startsWith("+++")) div.className = "plus";
+      else if (line.startsWith("-") && !line.startsWith("---")) div.className = "minus";
+      else if (line.startsWith("@@")) div.className = "hunk";
+    }
+    pre.appendChild(div);
+  }
+}
+$d("fileBack").addEventListener("click", () => { showPane(); });
+$d("lightbox").addEventListener("click", () => { $d("lightbox").hidden = true; });
+function markPending() {
+  const pend = pendingTasks();
+  $d("dPending").hidden = !(drawerTask && pend.has(drawerTask));
+}
+// live tail
+function laneForTask(tid) {
+  return STATE && STATE.lanes ? STATE.lanes.find(l => l.task === tid && l.log) : null;
+}
+function startLive(reset) {
+  clearInterval(liveTimer);
+  const lane = laneForTask(drawerTask);
+  if (!lane) return;
+  if (reset || livePath !== lane.log) { livePath = lane.log; liveOffset = 0; $d("livePre").textContent = ""; liveDone = false; $d("liveDone").hidden = true; }
+  const pollLive = async () => {
+    try {
+      const r = await fetch(`api/tail?path=${encodeURIComponent(livePath)}&offset=${liveOffset}`, { cache: "no-store" });
+      if (!r.ok) return;
+      const d = await r.json();
+      const pre = $d("livePre");
+      const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 30;
+      if (d.text) {
+        pre.textContent += d.text;
+        if (pre.textContent.length > 200000) pre.textContent = pre.textContent.slice(-200000);
+      }
+      liveOffset = d.offset;
+      const stillThere = laneForTask(drawerTask);
+      if (d.done || !stillThere || (stillThere && stillThere.log !== livePath)) {
+        liveDone = true; $d("liveDone").hidden = false; clearInterval(liveTimer);
+      }
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
+      $d("liveNew").hidden = atBottom;
+    } catch (e) {}
+  };
+  pollLive();
+  liveTimer = setInterval(pollLive, 1500);
+  $d("livePre").onscroll = () => {
+    const pre = $d("livePre");
+    $d("liveNew").hidden = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 30;
+  };
+  $d("liveNew").onclick = () => { const pre = $d("livePre"); pre.scrollTop = pre.scrollHeight; $d("liveNew").hidden = true; };
+}
+// task actions
+$d("dPrio").addEventListener("change", e => {
+  runAction(e.target, "api/command", { action: "set_priority", task: drawerTask, priority: +e.target.value });
+});
+$d("dStatusSel").addEventListener("change", e => {
+  runAction(e.target, "api/command", { action: "set_status", task: drawerTask, status: e.target.value });
+});
+$d("dRetry").addEventListener("click", e => {
+  runAction(e.target, "api/command", { action: "retry", task: drawerTask });
+});
+$d("dDrop").addEventListener("click", e => {
+  if (!confirm(`Drop ${drawerTask}?`)) return;
+  runAction(e.target, "api/command", { action: "set_status", task: drawerTask, status: "dropped" });
+});
+// ---- board
+const STATUSES = ["backlog", "ready", "in_progress", "blocked", "done", "dropped"];
+const ST_COLOR = { backlog: "#94a3b8", ready: "#38bdf8", in_progress: "#f59e0b", blocked: "#ef4444", done: "#22c55e", dropped: "#64748b" };
+const TYPE_ICON = { code: "💻", asset: "🎨", design: "📐", qa: "🎮" };
+let boardMsFilter = "", showAllDone = false;
+$d("boardFilter").addEventListener("change", e => { boardMsFilter = e.target.value; refreshBoard(true); });
+async function refreshBoard(keep) {
+  const b = await fetchBoard();
+  if (!b) return;
+  await fetchCommands();
+  const msSel = $d("boardFilter");
+  const cur = msSel.value;
+  const msIds = b.milestones || [];
+  msSel.replaceChildren(Object.assign(document.createElement("option"), { value: "", textContent: "All" }),
+    ...msIds.map(m => Object.assign(document.createElement("option"), { value: m, textContent: m })));
+  msSel.value = boardMsFilter || cur || "";
+  boardMsFilter = msSel.value;
+  const pend = pendingTasks();
+  const cols = $d("boardCols");
+  cols.replaceChildren(...STATUSES.map(s => {
+    const col = document.createElement("div"); col.className = "bcol";
+    const h = document.createElement("h4"); h.textContent = s.replace("_", " "); col.appendChild(h);
+    let cards = (b.tasks || []).filter(t => t.status === s && (!boardMsFilter || t.milestone === boardMsFilter));
+    cards.sort((a, c) => (a.priority - c.priority) || (a.id < c.id ? -1 : 1));
+    if (s === "done" && cards.length > 20 && !showAllDone) {
+      for (const t of cards.slice(0, 20)) col.appendChild(boardCard(t, pend));
+      const more = document.createElement("button");
+      more.type = "button"; more.textContent = `show all (${cards.length})`;
+      more.addEventListener("click", () => { showAllDone = true; refreshBoard(true); });
+      col.appendChild(more);
+    } else {
+      if (s === "done" && showAllDone) {
+        const less = document.createElement("button");
+        less.type = "button"; less.textContent = "collapse";
+        less.addEventListener("click", () => { showAllDone = false; refreshBoard(true); });
+        col.appendChild(less);
+      }
+      for (const t of cards) col.appendChild(boardCard(t, pend));
+    }
+    return col;
+  }));
+  $d("btnAddTask").hidden = !(STATE && STATE.manage);
+}
+function boardCard(t, pend) {
+  const c = document.createElement("div");
+  c.className = "bcard";
+  c.innerHTML = `<div class="bid"></div><div class="bt"></div><div class="bm"></div>`;
+  c.querySelector(".bid").textContent = `${TYPE_ICON[t.type] || "•"} ${t.id} P${t.priority ?? ""}`;
+  c.querySelector(".bt").textContent = t.title || "";
+  c.querySelector(".bm").textContent = `${t.milestone || ""} · ${t.attempts ?? 0} attempts${pend.has(t.id) ? " · ⏳ pending" : ""}`;
+  c.style.borderLeft = `4px solid ${ST_COLOR[t.status] || "#ccc"}`;
+  c.addEventListener("click", () => openDrawer(t.id));
+  return c;
+}
+// add-task modal
+$d("btnAddTask").addEventListener("click", async () => {
+  const b = await fetchBoard();
+  $d("addMs").replaceChildren(...(b.milestones || []).map(m => Object.assign(document.createElement("option"), { value: m, textContent: m })));
+  $d("addDeps").replaceChildren(...(b.tasks || []).map(t => Object.assign(document.createElement("option"), { value: t.id, textContent: t.id })));
+  $d("addModal").hidden = false;
+});
+$d("addX").addEventListener("click", () => { $d("addModal").hidden = true; });
+document.getElementById("addGo").addEventListener("click", e => {
+  const deps = [...$d("addDeps").selectedOptions].map(o => o.value);
+  const acc = $d("addAcc").value.split("\n").map(s => s.trim()).filter(Boolean);
+  runAction(e.target, "api/command", { action: "add_task", task: { title: $d("addTitle").value.trim(), description: $d("addDesc").value.trim(), milestone: $d("addMs").value, type: $d("addType").value, priority: +$d("addPrio").value, acceptance: acc, depends_on: deps } })
+    .then(() => { $d("addModal").hidden = true; });
+});
+// ---- graph
+let graphMsFilter = "", gz = 1, pan = { x: 0, y: 0 };
+$d("graphFilter").addEventListener("change", e => { graphMsFilter = e.target.value; refreshGraph(); });
+document.getElementById("gzIn").addEventListener("click", () => { gz = Math.min(3, gz * 1.2); drawGraph(); });
+document.getElementById("gzOut").addEventListener("click", () => { gz = Math.max(0.3, gz / 1.2); drawGraph(); });
+let graphData = null;
+async function refreshGraph() {
+  const b = await fetchBoard();
+  if (!b) return;
+  const msSel = $d("graphFilter");
+  msSel.replaceChildren(Object.assign(document.createElement("option"), { value: "", textContent: "All" }),
+    ...((b.milestones || []).map(m => Object.assign(document.createElement("option"), { value: m, textContent: m }))));
+  msSel.value = graphMsFilter;
+  graphData = layoutGraph(b);
+  drawGraph();
+}
+function layoutGraph(b) {
+  const ids = new Set((b.tasks || []).map(t => t.id));
+  let nodes = (b.tasks || []).filter(t => !graphMsFilter || t.milestone === graphMsFilter);
+  const byId = new Map(nodes.map(t => [t.id, t]));
+  // layers: longest depends_on path from a root; skip missing deps; ignore back-edges (cycles)
+  const layer = new Map();
+  const visiting = new Set();
+  function depth(id) {
+    if (layer.has(id)) return layer.get(id);
+    if (visiting.has(id)) return 0; // back-edge: ignore
+    visiting.add(id);
+    const t = byId.get(id);
+    let d = 0;
+    if (t) for (const dep of (t.depends_on || [])) {
+      if (!byId.has(dep) && !ids.has(dep)) continue;
+      if (!byId.has(dep)) continue; // skipped (filtered out)
+      d = Math.max(d, depth(dep) + 1);
+    }
+    visiting.delete(id);
+    layer.set(id, d);
+    return d;
+  }
+  for (const t of nodes) depth(t.id);
+  const layers = new Map();
+  for (const t of nodes) {
+    const l = layer.get(t.id) || 0;
+    if (!layers.has(l)) layers.set(l, []);
+    layers.get(l).push(t);
+  }
+  for (const arr of layers.values()) arr.sort((a, c) => (a.id < c.id ? -1 : 1));
+  return { layers: [...layers.entries()].sort((a, c) => a[0] - c[0]), byId };
+}
+function drawGraph() {
+  const svg = document.getElementById("graphSvg");
+  if (!graphData) return;
+  const Wpx = 900, Hpx = 420;
+  svg.setAttribute("viewBox", `0 0 ${Wpx} ${Hpx}`);
+  svg.replaceChildren();
+  const NS = "http://www.w3.org/2000/svg";
+  const g = document.createElementNS(NS, "g");
+  g.setAttribute("transform", `translate(${pan.x},${pan.y}) scale(${gz})`);
+  svg.appendChild(g);
+  const pos = new Map();
+  const layers = graphData.layers;
+  const maxRow = Math.max(1, ...layers.map(([, arr]) => arr.length));
+  layers.forEach(([l, arr], li) => {
+    const y = 40 + li * Math.max(60, (Hpx - 80) / Math.max(1, layers.length - 1 || 1));
+    arr.forEach((t, i) => {
+      const x = 60 + i * Math.max(80, (Wpx - 120) / Math.max(1, arr.length - 1 || 1));
+      pos.set(t.id, { x, y });
+    });
+  });
+  for (const [id, p] of pos) {
+    const t = graphData.byId.get(id);
+    for (const dep of (t.depends_on || [])) {
+      if (!pos.has(dep)) continue;
+      // skip back-edge that would point backwards in layers (cycle)
+      const q = pos.get(dep);
+      if (q.y >= p.y && layers.length > 1) {
+        // still draw but as a curved back-edge; spec says lay out cycles by ignoring the back-edge:
+        // skip edges that go from a deeper-or-equal layer to avoid clutter
+        const li = layers.findIndex(([, arr]) => arr.includes(t));
+        const lj = layers.findIndex(([, arr]) => arr.includes(graphData.byId.get(dep)));
+        if (lj >= li) continue;
+      }
+      const path = document.createElementNS(NS, "path");
+      const mx = (q.x + p.x) / 2;
+      path.setAttribute("d", `M ${q.x} ${q.y} C ${mx} ${q.y}, ${mx} ${p.y}, ${p.x} ${p.y}`);
+      path.setAttribute("fill", "none"); path.setAttribute("stroke", "#94a3b8"); path.setAttribute("stroke-width", "1.5");
+      g.appendChild(path);
+    }
+  }
+  for (const [id, p] of pos) {
+    const t = graphData.byId.get(id);
+    const cg = document.createElementNS(NS, "g");
+    cg.setAttribute("class", "gnode");
+    const r = document.createElementNS(NS, "rect");
+    r.setAttribute("x", p.x - 34); r.setAttribute("y", p.y - 14);
+    r.setAttribute("width", 68); r.setAttribute("height", 28); r.setAttribute("rx", 6);
+    r.setAttribute("fill", ST_COLOR[t.status] || "#ccc");
+    r.setAttribute("stroke", "#1a1c2c");
+    cg.appendChild(r);
+    const tx = document.createElementNS(NS, "text");
+    tx.setAttribute("x", p.x); tx.setAttribute("y", p.y + 4);
+    tx.setAttribute("text-anchor", "middle"); tx.textContent = id;
+    cg.appendChild(tx);
+    const title = document.createElementNS(NS, "title");
+    title.textContent = `${id}: ${t.title || ""} (${t.status})`;
+    cg.appendChild(title);
+    cg.addEventListener("click", () => openDrawer(id));
+    g.appendChild(cg);
+  }
+  // pan by dragging
+  if (!svg._panBound) {
+    svg._panBound = true;
+    let drag = null;
+    svg.addEventListener("pointerdown", e => { drag = { x: e.clientX, y: e.clientY, ox: pan.x, oy: pan.y }; svg.setPointerCapture(e.pointerId); });
+    svg.addEventListener("pointermove", e => { if (drag) { pan.x = drag.ox + (e.clientX - drag.x); pan.y = drag.oy + (e.clientY - drag.y); drawGraph(); } });
+    svg.addEventListener("pointerup", () => { drag = null; });
+  }
+}
+// ---- timeline
+let shots = [], shotIdx = 0, playTimer = 0;
+document.getElementById("btnTimeline").addEventListener("click", async () => {
+  document.getElementById("timeModal").hidden = false;
+  await loadShots();
+});
+document.getElementById("timeX").addEventListener("click", () => { document.getElementById("timeModal").hidden = true; stopPlay(); });
+document.getElementById("timeFilter").addEventListener("change", () => { shotIdx = 0; paintShot(); });
+document.getElementById("timePrev").addEventListener("click", () => timeStep(-1));
+document.getElementById("timeNext").addEventListener("click", () => timeStep(1));
+document.getElementById("timeRange").addEventListener("input", e => { shotIdx = +e.target.value; paintShot(); });
+document.getElementById("timePlay").addEventListener("click", e => {
+  if (playTimer) stopPlay();
+  else {
+    e.target.textContent = "⏸ Pause";
+    playTimer = setInterval(() => timeStep(1, true), 700);
+  }
+});
+document.getElementById("timeCap").addEventListener("click", () => {
+  const s = filteredShots()[shotIdx];
+  if (s) { document.getElementById("timeModal").hidden = true; stopPlay(); openDrawer(s.task); }
+});
+function stopPlay() { clearInterval(playTimer); playTimer = 0; const b = document.getElementById("timePlay"); if (b) b.textContent = "▶ Play"; }
+function filteredShots() {
+  const f = document.getElementById("timeFilter").value;
+  return shots.filter(s => !f || (BOARD_CACHE && (BOARD_CACHE.tasks || []).find(t => t.id === s.task && t.milestone === f)));
+}
+async function loadShots() {
+  try {
+    const r = await fetch("api/screenshots", { cache: "no-store" });
+    shots = r.ok ? await r.json() : [];
+  } catch (e) { shots = []; }
+  await fetchBoard();
+  const ms = new Set(shots.map(s => ((BOARD_CACHE.tasks || []).find(t => t.id === s.task) || {}).milestone).filter(Boolean));
+  const sel = document.getElementById("timeFilter");
+  sel.replaceChildren(Object.assign(document.createElement("option"), { value: "", textContent: "All" }),
+    ...[...ms].map(m => Object.assign(document.createElement("option"), { value: m, textContent: m })));
+  shotIdx = 0;
+  paintShot();
+}
+function paintShot() {
+  const list = filteredShots();
+  const empty = !list.length;
+  document.getElementById("timeEmpty").hidden = !empty;
+  document.getElementById("timeMain").hidden = empty;
+  if (empty) return;
+  shotIdx = ((shotIdx % list.length) + list.length) % list.length;
+  const s = list[shotIdx];
+  const img = document.getElementById("timeImg");
+  img.src = "api/file?path=" + encodeURIComponent(s.path);
+  document.getElementById("timeCap").textContent = `${s.task} · ${s.title || ""} · ${s.attempt} · ${s.t}`;
+  const rg = document.getElementById("timeRange");
+  rg.max = String(list.length - 1); rg.value = String(shotIdx);
+}
+function timeStep(d, loop) {
+  const list = filteredShots();
+  if (!list.length) return;
+  shotIdx = (shotIdx + d + list.length) % list.length;
+  paintShot();
+}
+// ticker + plates + bubbles open the drawer
+const _renderSide = renderSide;
+renderSide = function (st) {
+  _renderSide(st);
+  for (const li of document.querySelectorAll("#ticker li")) {
+    const txt = li.textContent || "";
+    const m = txt.match(/T-\d+/);
+    if (m) {
+      li.classList.add("hastask");
+      li.onclick = () => openDrawer(m[0]);
+    }
+  }
+  fetchCommands();
+  if (VIEW === "board") refreshBoard(true);
+  if (VIEW === "graph" && graphData) drawGraph();
+};
+const _bindTag = bindTag;
+bindTag = function (el, id, label) {
+  _bindTag(el, id, label);
+  if (el && !el._drawerBound) {
+    el._drawerBound = true;
+    el.addEventListener("click", () => {
+      const ch = chars.get(id);
+      const task = ch && ch.task ? ch.task : (label.match(/T-\d+/) || [])[0];
+      if (task) openDrawer(task);
+    });
+  }
+};
+const _bindPlate = bindPlate;
+bindPlate = function (el, i, label) {
+  _bindPlate(el, i, label);
+  if (el && !el._drawerBound) {
+    el._drawerBound = true;
+    el.addEventListener("click", () => {
+      const info = deskInfo[i];
+      if (info && info.task) openDrawer(info.task, info.log ? "live" : undefined);
+    });
+  }
+  // Watch affordance: busy plates show Watch
+  if (el) {
+    const info = deskInfo[i];
+    if (info && info.state === "busy" && info.log && !el.textContent.includes("Watch")) {
+      el.textContent += " 👁";
+      el.title = (el.title || "") + " · click to watch live log";
+    }
+  }
+};
+// remember which task each character works on (for drawer opens)
+const _applyState = applyState;
+applyState = function (st) {
+  _applyState(st);
+  for (const [id, ch] of chars) {
+    const job = (st.jobs || []).find(j => j.agent === ch.agent && ("desk" + laneDesk((j.station || "").split(":")[1])) === ch.targetKey);
+    if (job && job.task) ch.task = job.task;
+  }
+};
+setView(VIEW === "board" || VIEW === "graph" ? VIEW : "office");
+if (/^T-\d+$/.test(DEEP.get("task") || "")) setTimeout(() => openDrawer(DEEP.get("task")), 600);

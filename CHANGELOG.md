@@ -8,6 +8,11 @@ flag chips), a Requests panel writing to `project/OWNER_REQUESTS.md`, and a Heal
 probes grouped by account, test phone notification, supervisor start). Without `--manage` the
 server is read-only exactly as before; `--demo` shows the new UI but rejects every write.
 
+Phase 2: task drawer (Brief/Acceptance/Attempts + Live tail of `.live.log`), screenshot timeline,
+Board and dependency-graph views, and manage-mode task actions via `project/commands/` (priority,
+status, retry, add-task, with pending chips). The orchestrator streams live logs and runs a command
+inbox watcher; the Office fixes the 390 px horizontal scroll.
+
 ## 1.1.0 (2026-10-18)
 
 Positions are roles now, not models. Agents are `quarterback` / `qa_lead` / `coder_1..5`;
