@@ -50,15 +50,23 @@ def main() -> int:
     except OSError:
         events = []
     now = dt.datetime.now()
-    routed = {}
-    for line in events[-400:]:
-        m = re.match(r"(\S+ \S+)\s+(USAGE LIMIT|PROVIDER DOWN|MODEL GONE|PREEMPTIVE HANDOFF|QUOTA RESTORED) (\S+)", line)
-        if m:
-            routed[m.group(3)] = (m.group(2), m.group(1))
-    live = {k: v for k, v in routed.items() if v[0] != "QUOTA RESTORED"
-            and now - dt.datetime.strptime(v[1], "%Y-%m-%d %H:%M:%S") < dt.timedelta(hours=6)}
+    routed = {}  # agent -> (kind, account, until)
+    for line in events[-600:]:
+        m = re.match(r"(\S+ \S+)\s+(USAGE LIMIT|PROVIDER DOWN|MODEL GONE|PREEMPTIVE HANDOFF|QUOTA RESTORED) ([\w-]+)(?: \(([\w-]+)\))?", line)
+        if not m:
+            continue
+        when = dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        if m.group(2) == "QUOTA RESTORED":  # names an account: clear every agent on it
+            routed = {k: v for k, v in routed.items() if v[1] != m.group(3)}
+            continue
+        u = re.search(r"until ~(?:\w{3} )?(\d{1,2}):(\d{2})", line)
+        until = when.replace(hour=int(u.group(1)), minute=int(u.group(2)), second=0) if u else when + dt.timedelta(hours=1)
+        if until < when:
+            until += dt.timedelta(days=1)
+        routed[m.group(3)] = (m.group(2), m.group(4) or m.group(3), until)
+    live = {k: v for k, v in routed.items() if v[2] > now}
     if live:
-        print("routed around (last 6 h):", ", ".join(f"{k} ({v[0].lower()} since {v[1][11:16]})" for k, v in live.items()))
+        print("routed around now:", ", ".join(f"{k} ({v[0].lower()} until ~{v[2]:%H:%M})" for k, v in live.items()))
     print("\nlast events:")
     for line in events[-15:]:
         print("  " + line[:160])
