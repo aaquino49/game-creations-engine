@@ -1,9 +1,17 @@
 """Simulated office activity for previews. Never reads or writes project files."""
 import datetime as dt
+import random
 import time
 
 STARTED = time.monotonic()
 SCENES = ("working", "checks", "idle", "limits", "complete", "closed")
+
+_DEMO_TASKS = None
+_DEMO_TAIL = {"lines": [], "n": 0}
+
+
+def _rng(seed=20261018):
+    return random.Random(seed)
 
 
 def demo_state(scene="auto"):
@@ -77,3 +85,197 @@ def demo_state(scene="auto"):
             "events": events, "complete": scene == "complete", "configured": True, "demo": True,
             "scene": scene, "counts": {"done": 30 if scene == "complete" else 23, "in_progress": sum(l["state"] == "busy" for l in lanes),
                                       "ready": 0 if scene == "complete" else 4, "backlog": 0, "blocked": 0}}
+
+
+# ------------------------------------------------------------------ phase 3 demo (deterministic, seeded)
+
+_TITLES = ["Menu polish", "Save slots", "Footstep sounds", "Boss arena", "Tutorial signs",
+           "Night lighting", "Controller help", "Pause menu", "Coin magnet", "Slime sprites",
+           "Quest log", "Map fog", "Dialogue box", "Hit sparks", "Shop prices",
+           "Checkpoint flag", "Swim physics", "Photo mode", "Credits roll", "Daily seed",
+           "Cloud saves", "Emoji chat", "Fishing rod", "Pet corgi", "Snow storm",
+           "Lantern glow", "Minimap pins", "Boss music", "Idle anims", "Patch notes"]
+
+
+def demo_board():
+    """About 30 tasks over 3 milestones with dependencies and all statuses."""
+    global _DEMO_TASKS
+    if _DEMO_TASKS is not None:
+        return _DEMO_TASKS
+    rng = _rng()
+    statuses = (["done"] * 12 + ["in_progress"] * 3 + ["ready"] * 5 + ["backlog"] * 6
+                + ["blocked"] * 2 + ["dropped"] * 2)
+    rng.shuffle(statuses)
+    tasks = []
+    for i in range(30):
+        n = i + 1
+        tid = f"T-{n}"
+        mid = "M1" if n <= 10 else "M2" if n <= 20 else "M3"
+        deps = []
+        if n > 1 and rng.random() < 0.5:
+            deps = [f"T-{rng.randint(1, n - 1)}"]
+        if n > 3 and rng.random() < 0.2:
+            deps.append(f"T-{rng.randint(1, n - 1)}")
+        deps = sorted(set(deps))
+        tasks.append({"id": tid, "title": _TITLES[i], "status": statuses[i],
+                      "milestone": mid, "priority": rng.randint(1, 5),
+                      "type": rng.choice(["code", "code", "code", "asset", "design", "qa"]),
+                      "owner": "coder", "depends_on": deps,
+                      "attempts": rng.randint(1, 3) if statuses[i] in ("done", "blocked") else rng.randint(0, 2)})
+    _DEMO_TASKS = {"tasks": tasks, "milestones": ["M1", "M2", "M3"]}
+    return _DEMO_TASKS
+
+
+def demo_task(tid):
+    """Task details with 1-3 attempts, histories and review summaries."""
+    b = demo_board()
+    t = next((x for x in b["tasks"] if x["id"] == tid), None)
+    if t is None:
+        t = dict(b["tasks"][0])
+        t = dict(t)
+        t["id"] = tid
+    rng = _rng(hash(tid) % (2 ** 31))
+    n = max(1, min(3, t.get("attempts", 1) or 1))
+    workers = ["coder_1", "coder_3", "coder_2", "qa_lead"]
+    attempts, history = [], []
+    for a in range(1, n + 1):
+        w = workers[(hash(tid) + a) % len(workers)]
+        verdict = "approve" if (a == n and t["status"] == "done") else rng.choice(["approve", "revise"])
+        attempts.append({"n": a, "files": [
+            {"name": "work.json", "size": 120, "kind": "json"},
+            {"name": f"work.{w}.log", "size": 300, "kind": "log"}],
+            "work": {"status": "done", "summary": f"demo work for {tid} attempt {a}", "worker": w},
+            "qa": {"verdict": "pass", "summary": f"demo QA {a}"},
+            "review": {"verdict": verdict, "summary": f"demo review {a}: {verdict}"}})
+        history.append({"attempt": a, "at": "2026-10-17 10:00:00", "worker": w,
+                        "work": "done", "checks": True, "qa": "pass",
+                        "checks_after_qa": True, "review": verdict})
+    out = dict(t)
+    out["brief"] = f"# {t['id']}: {t['title']}\n\nDemo brief for {t['title']}.\n"
+    out["attempts_count"] = n
+    out["attempts"] = attempts
+    out["history"] = history
+    out["acceptance"] = ["demo criterion one", "demo criterion two"]
+    out["description"] = f"Demo description for {t['title']}."
+    return out
+
+
+def demo_tail(path, offset):
+    """A fake .log that grows by a few lines per call, so the Live tab animates."""
+    try:
+        off = int(offset)
+        if off < 0:
+            off = 0
+    except (TypeError, ValueError):
+        off = 0
+    _DEMO_TAIL["n"] += 1
+    for _ in range(3):
+        _DEMO_TAIL["lines"].append(
+            f"2026-10-18 12:{_DEMO_TAIL['n']:02d}:00  demo {_DEMO_TAIL['n']} working on {path or 'project/runs/T-1/a1/work.coder_1.log'}\n")
+        _DEMO_TAIL["n"] += 0  # keep counter stable per call batch
+    full = "".join(_DEMO_TAIL["lines"])
+    if off > len(full):
+        off = 0
+    text = full[off:]
+    return {"text": text, "offset": len(full), "size": len(full), "done": False}
+
+
+def demo_file(path):
+    if (path or "").endswith(".png"):
+        return None  # caller serves bytes instead
+    if "decisions" in (path or ""):
+        return "# Decisions (demo)\n\n| Date | Decision | Why |\n|---|---|---|\n| 2026-10-17 | Demo ships | showcase |\n"
+    return f"# Demo file\n\nThis is simulated content for {path}.\n"
+
+
+def demo_stats(hours=24):
+    """3 days of stats: scorecards, throughput, a Gantt with naps, fallbacks, incidents."""
+    now = dt.datetime.now()
+    rng = _rng(hours)
+    agents = ["coder_1", "coder_2", "coder_3", "qa_lead", "quarterback"]
+    scorecards = []
+    for i, a in enumerate(agents):
+        scorecards.append({"agent": a, "attempts": 8 - i, "first_pass": 3 - min(i, 2),
+                           "approval_rate": round(0.75 - i * 0.05, 3),
+                           "checks_rate": round(0.9 - i * 0.03, 3),
+                           "qa_rate": round(0.8 - i * 0.04, 3),
+                           "median_work_min": round(18.0 + i * 3.5, 1),
+                           "blocked": 1 if a == "coder_3" else 0,
+                           "substitutions": 2 if a == "coder_3" else 0})
+    scorecards.sort(key=lambda d: (-d["first_pass"], -(d["approval_rate"] or 0)))
+    bh = 1 if hours in (6, 24) else 6
+    n = max(1, hours // bh)
+    start = now - dt.timedelta(hours=hours)
+    buckets = [{"start": (start + dt.timedelta(hours=i * bh)).strftime("%Y-%m-%d %H:%M:%S"),
+                "count": (i * 7 + hours) % 4} for i in range(n)]
+    series = [{"t": (start + dt.timedelta(hours=i * bh)).strftime("%Y-%m-%d %H:%M:%S"),
+               "open": {"M1": max(0, 4 - i // 4), "M2": 8, "M3": 10}} for i in range(n + 1)]
+    gantt = {"lanes": [{"lane": "A", "bars": [
+        {"task": "T-1", "title": "Menu polish",
+         "start": (now - dt.timedelta(hours=5)).strftime("%Y-%m-%d %H:%M:%S"),
+         "end": (now - dt.timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S"),
+         "outcome": "done", "attempts": 1, "duration_min": 120.0},
+        {"task": "T-2", "title": "Save slots",
+         "start": (now - dt.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S"),
+         "end": now.strftime("%Y-%m-%d %H:%M:%S"),
+         "outcome": "running", "attempts": 2, "duration_min": 120.0}]},
+        {"lane": "B", "bars": []}],
+        "naps": [{"account": "openai", "bars": [
+            {"start": (now - dt.timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S"),
+             "end": (now - dt.timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S"),
+             "reason": "USAGE LIMIT", "hours": 3.0}]}],
+        "now": now.strftime("%Y-%m-%d %H:%M:%S")}
+    routing = {"flows": [{"from": "coder_2", "to": "coder_3", "count": 3},
+                         {"from": "coder_1", "to": "coder_3", "count": 1}],
+               "counts": {a: {"usage_limit": 1 if a == "coder_2" else 0, "preemptive": 0,
+                              "provider_down": 0, "model_gone": 0, "quick_fail": 0,
+                              "agent_fail": 0} for a in agents}}
+    quota = {"accounts": [
+        {"id": "openai", "state": "ok", "until": "", "limits": 2, "hours_limited": 5.0},
+        {"id": "meta_api", "state": "ok", "until": "", "limits": 0, "hours_limited": 0.0}]}
+    incidents = {"counts": {"supervisor_ai": 2},
+                 "items": [
+                     {"time": now.strftime("%Y-%m-%d %H:%M:%S"), "type": "supervisor_ai",
+                      "agent": "claude", "reason": "lane B quiet", "outcome": "done",
+                      "summary": "nudged lane B", "duration_min": 4.0},
+                     {"time": (now - dt.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S"),
+                      "type": "supervisor_ai", "agent": "codex", "reason": "stale lock",
+                      "outcome": "in progress", "summary": "", "duration_min": None}]}
+    opencode = {"days1": {"total": 0.16, "models": {
+        "meta/muse-spark-1.3-contributor": {"messages": 282, "input_tokens": 674300,
+                                            "output_tokens": 193400, "cost": 0.1622}}},
+        "days7": {"total": 1.2, "models": {}},
+        "error": None, "updated": time.time()}
+    codex = {"primary": {"used_percent": 42.0, "window_minutes": 300, "resets_at": int(time.time()) + 3600},
+             "secondary": {"used_percent": 11.0, "window_minutes": 10080, "resets_at": int(time.time()) + 86400}}
+    return {"hours": hours, "now": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "window_start": start.strftime("%Y-%m-%d %H:%M:%S"),
+            "scorecards": scorecards, "scorecards_all": scorecards,
+            "throughput": {"bucket_hours": bh, "buckets": buckets},
+            "burndown": {"milestones": ["M1", "M2", "M3"], "series": series},
+            "eta": {"milestone": {"id": "M2", "remaining": 8, "label": "~4.0 h", "low": False},
+                    "board": {"remaining": 18, "label": "~9.0 h", "low": False},
+                    "done_12h": 24, "rate_per_hour": 2.0},
+            "gantt": gantt, "routing": routing, "quota": quota,
+            "codex": codex, "opencode": opencode, "paid_models": ["meta/muse-spark-1.3-contributor"],
+            "incidents": incidents}
+
+
+def demo_notes():
+    now = dt.datetime.now()
+    plans = [
+        {"time": now.strftime("%Y-%m-%d %H:%M:%S"), "reason": "demo plan two",
+         "duration_min": 6.0, "summary": "planned the showcase board"},
+        {"time": (now - dt.timedelta(hours=5)).strftime("%Y-%m-%d %H:%M:%S"),
+         "reason": "demo plan one", "duration_min": 4.0, "summary": "seeded three milestones"}]
+    docs = [{"name": "decisions", "path": "project/decisions.md", "mtime": now.strftime("%Y-%m-%d %H:%M:%S")},
+            {"name": "assumptions", "path": "project/assumptions.md", "mtime": now.strftime("%Y-%m-%d %H:%M:%S")},
+            {"name": "PM notes", "path": "project/PM_NOTES.md", "mtime": now.strftime("%Y-%m-%d %H:%M:%S")},
+            {"name": "milestone M1", "path": "project/milestones/M1.md", "mtime": now.strftime("%Y-%m-%d %H:%M:%S")}]
+    return {"plans": plans, "docs": docs}
+
+
+def demo_build():
+    now = dt.datetime.now()
+    return {"exe": "builds/demo-game.exe", "exists": True,
+            "mtime": now.strftime("%Y-%m-%d %H:%M"), "size_mb": 42.5, "tag": "v1.0-demo"}

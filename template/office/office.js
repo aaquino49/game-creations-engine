@@ -958,12 +958,13 @@ wireManage();
 // ------------------------------------------------------------------ phase 2: views, drawer, timeline, board/graph, actions
 let VIEW = "office";
 try { VIEW = localStorage.getItem("officeView") || "office"; } catch (e) {}
-if (["office", "board", "graph"].includes(DEEP.get("view"))) VIEW = DEEP.get("view");
+if (["office", "board", "graph", "stats", "notes"].includes(DEEP.get("view"))) VIEW = DEEP.get("view");
 function setView(v) {
   VIEW = v;
   try { localStorage.setItem("officeView", v); } catch (e) {}
-  for (const [id, name] of [["viewOffice", "office"], ["viewBoard", "board"], ["viewGraph", "graph"]]) {
+  for (const [id, name] of [["viewOffice", "office"], ["viewBoard", "board"], ["viewGraph", "graph"], ["viewStats", "stats"], ["viewNotes", "notes"]]) {
     const b = document.getElementById(id);
+    if (!b) continue;
     b.classList.toggle("on", VIEW === name);
     b.setAttribute("aria-pressed", VIEW === name ? "true" : "false");
   }
@@ -971,12 +972,18 @@ function setView(v) {
   document.getElementById("hint").style.display = VIEW === "office" ? "" : "none";
   document.getElementById("boardView").hidden = VIEW !== "board";
   document.getElementById("graphView").hidden = VIEW !== "graph";
+  document.getElementById("statsView").hidden = VIEW !== "stats";
+  document.getElementById("notesView").hidden = VIEW !== "notes";
   if (VIEW === "board") refreshBoard();
   if (VIEW === "graph") refreshGraph();
+  if (VIEW === "stats") refreshStats();
+  if (VIEW === "notes") refreshNotes();
 }
 document.getElementById("viewOffice").addEventListener("click", () => setView("office"));
 document.getElementById("viewBoard").addEventListener("click", () => setView("board"));
 document.getElementById("viewGraph").addEventListener("click", () => setView("graph"));
+document.getElementById("viewStats").addEventListener("click", () => setView("stats"));
+document.getElementById("viewNotes").addEventListener("click", () => setView("notes"));
 
 let BOARD_CACHE = null, CMD_CACHE = { pending: [], done: [] };
 async function fetchBoard() {
@@ -1161,10 +1168,23 @@ function paintDrawer(d) {
   $d("dActions").hidden = !manage;
   if (manage) {
     $d("dPrio").value = String(d.priority ?? 3);
-    $d("dStatusSel").value = ["backlog", "ready", "dropped"].includes(d.status) ? d.status : "backlog";
     const busy = d.status === "in_progress" || d.status === "done";
-    $d("dStatusSel").disabled = busy;
+    const sel = $d("dStatusSel");
+    if (busy && ![...sel.options].some(o => o.value === d.status)) {
+      const o = document.createElement("option");
+      o.value = d.status; o.textContent = d.status;
+      sel.appendChild(o);
+    }
+    sel.value = busy ? d.status : (["backlog", "ready", "dropped"].includes(d.status) ? d.status : "backlog");
+    sel.disabled = busy;
     $d("dRetry").hidden = d.status !== "blocked";
+    $d("dDrop").hidden = busy;
+    if (!busy && ![...sel.options].some(o => o.value === "backlog")) { /* keep original options */ }
+    if (!busy) {
+      // drop any temporary busy-only option
+      [...sel.options].forEach(o => { if (o.value === "in_progress" || o.value === "done") o.remove(); });
+      $d("dDrop").hidden = false;
+    }
   }
   paintTabs(); showPane();
 }
@@ -1392,7 +1412,7 @@ function drawGraph() {
   layers.forEach(([l, arr], li) => {
     const y = 40 + li * Math.max(60, (Hpx - 80) / Math.max(1, layers.length - 1 || 1));
     arr.forEach((t, i) => {
-      const x = 60 + i * Math.max(80, (Wpx - 120) / Math.max(1, arr.length - 1 || 1));
+      const x = 90 + i * Math.max(160, (Wpx - 180) / Math.max(1, arr.length - 1 || 1));
       pos.set(t.id, { x, y });
     });
   });
@@ -1421,14 +1441,15 @@ function drawGraph() {
     const cg = document.createElementNS(NS, "g");
     cg.setAttribute("class", "gnode");
     const r = document.createElementNS(NS, "rect");
-    r.setAttribute("x", p.x - 34); r.setAttribute("y", p.y - 14);
-    r.setAttribute("width", 68); r.setAttribute("height", 28); r.setAttribute("rx", 6);
+    r.setAttribute("x", p.x - 75); r.setAttribute("y", p.y - 16);
+    r.setAttribute("width", 150); r.setAttribute("height", 32); r.setAttribute("rx", 6);
     r.setAttribute("fill", ST_COLOR[t.status] || "#ccc");
     r.setAttribute("stroke", "#1a1c2c");
     cg.appendChild(r);
     const tx = document.createElementNS(NS, "text");
     tx.setAttribute("x", p.x); tx.setAttribute("y", p.y + 4);
-    tx.setAttribute("text-anchor", "middle"); tx.textContent = id;
+    tx.setAttribute("text-anchor", "middle");
+    tx.textContent = `${id} ${(t.title || "").slice(0, 18)}`.trim();
     cg.appendChild(tx);
     const title = document.createElementNS(NS, "title");
     title.textContent = `${id}: ${t.title || ""} (${t.status})`;
@@ -1561,5 +1582,338 @@ applyState = function (st) {
     if (job && job.task) ch.task = job.task;
   }
 };
-setView(VIEW === "board" || VIEW === "graph" ? VIEW : "office");
+
+// ------------------------------------------------------------------ phase 3: stats, notes, build/play
+function statAgentColor(agent) {
+  if (typeof LOOKS !== "undefined" && LOOKS[agent] && LOOKS[agent].shirt) return LOOKS[agent].shirt;
+  let h = 0;
+  for (const c of agent) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return PALETTE[h % PALETTE.length];
+}
+function svgEl(tag, attrs, parent) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, v);
+  if (parent) parent.appendChild(el);
+  return el;
+}
+function svgTitle(parent, text) {
+  const t = document.createElementNS("http://www.w3.org/2000/svg", "title");
+  t.textContent = text;
+  parent.appendChild(t);
+}
+function svgText(g, x, y, s, attrs) {
+  const t = svgEl("text", { x, y, "font-size": 10, fill: "var(--muted)", ...(attrs || {}) }, g);
+  t.textContent = s;
+  return t;
+}
+function windowLabel(h) {
+  return h === "6" || h === 6 ? "6 h" : h === "72" || h === 72 ? "3 d" : h === "168" || h === 168 ? "7 d" : "24 h";
+}
+let STATS_CACHE = null;
+async function refreshStats() {
+  const h = document.getElementById("statsWindow").value || "24";
+  const box = document.getElementById("statsBody");
+  box.replaceChildren(Object.assign(document.createElement("div"), { textContent: "Loading stats…", className: "muted" }));
+  try {
+    const r = await fetch("api/stats?hours=" + encodeURIComponent(h), { cache: "no-store" });
+    if (!r.ok) throw new Error("stats " + r.status);
+    STATS_CACHE = await r.json();
+  } catch (e) { box.replaceChildren(Object.assign(document.createElement("div"), { textContent: "Stats unavailable.", className: "muted" })); return; }
+  paintStats(STATS_CACHE);
+}
+document.getElementById("statsWindow").addEventListener("change", refreshStats);
+document.getElementById("statsAll").addEventListener("change", () => { if (STATS_CACHE) paintStats(STATS_CACHE); });
+function statTable(headers, rows) {
+  const wrap = document.createElement("div"); wrap.className = "tablewrap";
+  const tb = document.createElement("table"); tb.className = "grid";
+  const tr = document.createElement("tr");
+  for (const h of headers) { const th = document.createElement("th"); th.textContent = h; tr.appendChild(th); }
+  tb.appendChild(tr);
+  for (const row of rows) {
+    const t2 = document.createElement("tr");
+    for (const c of row) { const td = document.createElement("td"); td.textContent = c; t2.appendChild(td); }
+    tb.appendChild(t2);
+  }
+  wrap.appendChild(tb);
+  return wrap;
+}
+function paintStats(d) {
+  const box = document.getElementById("statsBody");
+  const useWindow = document.getElementById("statsAll").checked;
+  const scores = useWindow ? (d.scorecards || []) : (d.scorecards_all || d.scorecards || []);
+  const wl = windowLabel(d.hours);
+  box.replaceChildren();
+  const h = (t) => { const e = document.createElement("h3"); e.textContent = t; box.appendChild(e); };
+  const cap = (t) => { const e = document.createElement("div"); e.className = "caption"; e.textContent = t; box.appendChild(e); };
+  // S1
+  h("Agent scorecards and leaderboard");
+  box.appendChild(statTable(["agent", "attempts", "first-pass", "approval", "checks", "QA", "median min", "blocked", "sub"],
+    scores.map((s, i) => [(i === 0 ? "🏆 " : "") + s.agent, String(s.attempts ?? ""),
+      String(s.first_pass ?? ""), s.approval_rate == null ? "—" : String(s.approval_rate),
+      s.checks_rate == null ? "—" : String(s.checks_rate), s.qa_rate == null ? "—" : String(s.qa_rate),
+      s.median_work_min == null ? "—" : String(s.median_work_min),
+      String(s.blocked ?? ""), String(s.substitutions ?? "")])));
+  cap(useWindow ? `This window (${wl}). Top row gets 🏆.` : "All time. Tick “this window” to restrict to the selected window. Top row gets 🏆.");
+  // S2 throughput bar chart
+  h("Throughput and burndown");
+  const tp = d.throughput || { buckets: [], bucket_hours: 1 };
+  if (!tp.buckets.length || !tp.buckets.some(b => b.count > 0)) {
+    const e = document.createElement("div"); e.className = "muted"; e.textContent = `No completed tasks in the last ${wl}`;
+    box.appendChild(e);
+  } else {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 520 180"); svg.setAttribute("class", "chart"); svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "DONE tasks per hour");
+    const wrap = document.createElement("div"); wrap.className = "chartwrap"; wrap.appendChild(svg); box.appendChild(wrap);
+    const max = Math.max(1, ...tp.buckets.map(b => b.count));
+    const n = tp.buckets.length, bw = 460 / Math.max(1, n);
+    svgText(svg, 4, 14, "DONE / " + (tp.bucket_hours > 1 ? "6 h" : "hour"), {});
+    svgText(svg, 470, 174, "time →", {});
+    tp.buckets.forEach((b, i) => {
+      const bh = Math.round(130 * b.count / max);
+      const x = 40 + i * bw, y = 150 - bh;
+      const r = svgEl("rect", { x: x.toFixed(1), y, width: Math.max(1, bw - 2).toFixed(1), height: bh, fill: "var(--accent)" }, svg);
+      svgTitle(r, `${b.start}: ${b.count} DONE`);
+      if (i % Math.ceil(n / 6) === 0) svgText(svg, x, 164, b.start.slice(5, 13), {});
+    });
+    svgText(svg, 4, 150, String(max), {}); svgText(svg, 4, 40, "0", {});
+  }
+  cap(`DONE events per ${tp.bucket_hours > 1 ? "6 h" : "hour"} over the last ${wl}.`);
+  const bd = d.burndown || { milestones: [], series: [] };
+  if (bd.series.length && bd.milestones.length) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 520 190"); svg.setAttribute("class", "chart"); svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "Open tasks per milestone");
+    const wrap = document.createElement("div"); wrap.className = "chartwrap"; wrap.appendChild(svg); box.appendChild(wrap);
+    const cols = ["var(--accent)", "var(--good)", "var(--warn)", "var(--bad)"];
+    const max = Math.max(1, ...bd.series.flatMap(p => Object.values(p.open || {})));
+    svgText(svg, 4, 14, "open tasks", {});
+    svgText(svg, 470, 184, "time →", {});
+    bd.milestones.forEach((mid, mi) => {
+      const pts = bd.series.map((p, i) => `${(40 + i * 460 / Math.max(1, bd.series.length - 1)).toFixed(1)},${(160 - 130 * (p.open[mid] || 0) / max).toFixed(1)}`).join(" ");
+      const pl = svgEl("polyline", { points: pts, fill: "none", stroke: cols[mi % cols.length], "stroke-width": 2 }, svg);
+      svgTitle(pl, `${mid}: ${bd.series.map(p => p.open[mid]).join(" → ")} open`);
+      bd.series.forEach((p, i) => {
+        const cx = 40 + i * 460 / Math.max(1, bd.series.length - 1), cy = 160 - 130 * (p.open[mid] || 0) / max;
+        const c = svgEl("circle", { cx: cx.toFixed(1), cy: cy.toFixed(1), r: 3, fill: cols[mi % cols.length] }, svg);
+        svgTitle(c, `${mid} at ${p.t}: ${p.open[mid]} open`);
+      });
+    });
+    svgText(svg, 40, 176, (bd.series[0] || {}).t ? bd.series[0].t.slice(5, 13) : "", {});
+  }
+  cap("Open tasks per milestone over the window (creation → DONE; dropped tasks excluded).");
+  const eta = d.eta || {};
+  const e = document.createElement("div");
+  const fmt = (o) => !o ? "—" : (o.label || "—") + (o.low ? " (low confidence)" : "");
+  e.textContent = `ETA ${eta.milestone?.id || ""}: ${fmt(eta.milestone)} · whole board: ${fmt(eta.board)}`;
+  box.appendChild(e);
+  // S3 gantt
+  h("Lane timeline");
+  const g = d.gantt || { lanes: [], naps: [] };
+  if (!g.lanes.length || !g.lanes.some(l => (l.bars || []).length)) {
+    const x = document.createElement("div"); x.className = "muted"; x.textContent = `No completed tasks in the last ${wl}`; box.appendChild(x);
+  } else {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    const rows = g.lanes.length + g.naps.length;
+    svg.setAttribute("viewBox", `0 0 520 ${60 + rows * 26}`); svg.setAttribute("class", "chart");
+    svg.setAttribute("role", "img"); svg.setAttribute("aria-label", "Lane timeline");
+    const wrap = document.createElement("div"); wrap.className = "chartwrap"; wrap.appendChild(svg); box.appendChild(wrap);
+    const t0 = Date.parse((g.lanes.flatMap(l => l.bars).map(b => b.start).sort()[0] || d.window_start).replace(" ", "T"));
+    const t1 = Date.parse((d.now || "").replace(" ", "T")) || (t0 + 3600000);
+    const X = (s) => 70 + 420 * (Date.parse(s.replace(" ", "T")) - t0) / Math.max(1, t1 - t0);
+    const OUT = { done: "#22c55e", blocked: "#ef4444", running: "#f59e0b", recover: "#38bdf8" };
+    svgText(svg, 4, 14, "lane", {}); svgText(svg, 480, 14 + rows * 26, "time →", {});
+    g.lanes.forEach((ln, ri) => {
+      const y = 24 + ri * 26;
+      svgText(svg, 4, y + 10, "lane " + ln.lane, {});
+      for (const b of ln.bars) {
+        const r = svgEl("rect", { x: X(b.start).toFixed(1), y, width: Math.max(2, X(b.end) - X(b.start)).toFixed(1), height: 14, fill: OUT[b.outcome] || "var(--accent)", stroke: "#1a1c2c" }, svg);
+        svgTitle(r, `${b.task}: ${b.title || ""} · ${b.outcome} · ${b.duration_min} min · ${b.attempts} attempts`);
+        r.style.cursor = "pointer";
+        r.addEventListener("click", () => openDrawer(b.task));
+        const tx = svgEl("text", { x: (X(b.start) + 3).toFixed(1), y: y + 11, "font-size": 9, fill: "#fff" }, svg);
+        tx.textContent = b.task;
+      }
+    });
+    const defs = svgEl("defs", {}, svg);
+    const pat = svgEl("pattern", { id: "naphatch", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" }, defs);
+    svgEl("rect", { width: 6, height: 6, fill: "var(--warn)" }, pat);
+    svgEl("line", { x1: 0, y1: 0, x2: 0, y2: 6, stroke: "var(--panel)", "stroke-width": 2 }, pat);
+    g.naps.forEach((nr, k) => {
+      const y = 24 + (g.lanes.length + k) * 26;
+      svgText(svg, 4, y + 10, nr.account.slice(0, 10), {});
+      for (const b of nr.bars) {
+        const r = svgEl("rect", { x: X(b.start).toFixed(1), y, width: Math.max(2, X(b.end) - X(b.start)).toFixed(1), height: 14, fill: "url(#naphatch)", stroke: "var(--warn)" }, svg);
+        svgTitle(r, `${nr.account} limited (${b.reason}): ${b.start} → ${b.end}`);
+      }
+    });
+    const nx = 70 + 420 * 1;
+    svgEl("line", { x1: Math.min(490, nx), y1: 20, x2: Math.min(490, nx), y2: 20 + rows * 26, stroke: "var(--bad)", "stroke-width": 1.5 }, svg);
+    svgText(svg, Math.min(470, nx) - 10, 22 + rows * 26, "now", {});
+  }
+  cap("Bars run START → DONE / BLOCKED / RECOVER (or now). Hatched rows are account limits. Click a bar for the task.");
+  // S4 routing
+  h("Routing flow");
+  const rt = d.routing || { flows: [], counts: {} };
+  if (!(rt.flows || []).length) {
+    const x = document.createElement("div"); x.className = "muted"; x.textContent = `No completed tasks in the last ${wl}`; box.appendChild(x);
+  } else {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 520 150"); svg.setAttribute("class", "chart");
+    svg.setAttribute("role", "img"); svg.setAttribute("aria-label", "Fallback flow");
+    const wrap = document.createElement("div"); wrap.className = "chartwrap"; wrap.appendChild(svg); box.appendChild(wrap);
+    svgText(svg, 10, 14, "limited", {}); svgText(svg, 440, 14, "substitute", {});
+    const lefts = [...new Set(rt.flows.map(f => f.from))], rights = [...new Set(rt.flows.map(f => f.to))];
+    const max = Math.max(1, ...rt.flows.map(f => f.count));
+    rt.flows.forEach((f, i) => {
+      const y = 30 + i * 24;
+      svgText(svg, 10, y + 10, f.from, {});
+      svgText(svg, 440, y + 10, f.to, {});
+      const w = 40 + 220 * f.count / max;
+      const r = svgEl("rect", { x: 150, y, width: w.toFixed(1), height: 14, fill: statAgentColor(f.from) }, svg);
+      svgTitle(r, `${f.from} → ${f.to}: ${f.count} fallbacks`);
+    });
+  }
+  cap("FALLBACK bands: limited agents (left) to substitutes (right), width ∝ count.");
+  const agents = Object.keys(rt.counts || {});
+  if (agents.length) box.appendChild(statTable(["agent", "USAGE LIMIT", "PREEMPTIVE", "PROVIDER DOWN", "MODEL GONE", "QUICK FAIL", "AGENT FAIL"],
+    agents.map(a => [a, ...["usage_limit", "preemptive", "provider_down", "model_gone", "quick_fail", "agent_fail"].map(k => String(rt.counts[a][k] ?? 0))])));
+  // S5 quota + cost
+  h("Quota and cost");
+  const q = d.quota || { accounts: [] };
+  if ((q.accounts || []).length) box.appendChild(statTable(["account", "state", "until", "limits", "hours limited"],
+    q.accounts.map(a => [a.id, a.state + (a.until ? " ~" + a.until : ""), a.until || "", String(a.limits ?? ""), String(a.hours_limited ?? "")])));
+  cap("Per-account state from limits(), limits in window and total hours limited.");
+  const cx = d.codex;
+  if (cx && (cx.primary || cx.secondary)) {
+    for (const k of ["primary", "secondary"]) {
+      const w = cx[k] || {};
+      if (w.used_percent == null) continue;
+      const row = document.createElement("div");
+      const reset = w.resets_at ? new Date(w.resets_at * 1000).toLocaleString() : "";
+      row.innerHTML = "";
+      const nm = document.createElement("span"); nm.textContent = `Codex ${k}: ${(w.used_percent).toFixed(0)}% `;
+      const meter = document.createElement("span"); meter.className = "meter";
+      const fill = document.createElement("span"); fill.style.width = Math.min(100, w.used_percent) + "%";
+      meter.appendChild(fill);
+      const rs = document.createElement("span"); rs.className = "muted"; rs.textContent = ` resets ${reset}`;
+      row.append(nm, meter, rs);
+      row.title = `Codex ${k}: ${w.used_percent}% used, resets ${reset}`;
+      box.appendChild(row);
+    }
+  } else {
+    const x = document.createElement("div"); x.className = "muted"; x.textContent = "Codex usage unavailable"; box.appendChild(x);
+  }
+  const oc = d.opencode;
+  const paid = new Set(d.paid_models || []);
+  const spend = (key, title) => {
+    const p = oc && oc[key];
+    const hh = document.createElement("h3"); hh.textContent = title; hh.style.fontSize = "12px"; box.appendChild(hh);
+    if (!p || (!p.models && p.total == null)) {
+      const x = document.createElement("div"); x.className = "muted";
+      x.textContent = "spend unavailable" + (oc && oc.error ? ": " + oc.error : "");
+      box.appendChild(x);
+      return;
+    }
+    const rows = Object.entries(p.models || {}).map(([m, v]) => [m + (paid.has(m) ? " (paid)" : ""), String(v.messages ?? ""), String(v.input_tokens ?? ""), String(v.output_tokens ?? ""), String(v.cost ?? "")]);
+    box.appendChild(statTable(["model", "messages", "input", "output", "cost"], rows));
+    const t = document.createElement("div"); t.className = "muted"; t.textContent = `Total: $${p.total ?? "?"}`; box.appendChild(t);
+  };
+  if (oc) { spend("days1", "OpenCode spend · last day"); spend("days7", "OpenCode spend · last 7 days"); }
+  // S6 incidents
+  h("Incident log");
+  const inc = d.incidents || { counts: {}, items: [] };
+  const cc = document.createElement("div"); cc.className = "muted";
+  cc.textContent = Object.entries(inc.counts || {}).map(([k, v]) => `${k}: ${v}`).join(" · ") || "no incidents";
+  box.appendChild(cc);
+  if (!(inc.items || []).length) {
+    const x = document.createElement("div"); x.className = "muted"; x.textContent = `No completed tasks in the last ${wl}`; box.appendChild(x);
+  } else {
+    box.appendChild(statTable(["time", "type", "reason", "outcome", "duration"],
+      inc.items.map(i => [i.time, i.type + (i.agent ? " " + i.agent : ""), (i.reason || "").slice(0, 80), i.outcome || "", i.duration_min == null ? "—" : String(i.duration_min)])));
+  }
+}
+// ---- notes
+let NOTES_CACHE = null, NOTES_SEL = null;
+async function refreshNotes() {
+  const ul = document.getElementById("notesList");
+  ul.replaceChildren(Object.assign(document.createElement("li"), { textContent: "Loading…", className: "muted" }));
+  try {
+    const r = await fetch("api/notes", { cache: "no-store" });
+    if (!r.ok) throw new Error("notes " + r.status);
+    NOTES_CACHE = await r.json();
+  } catch (e) { ul.replaceChildren(Object.assign(document.createElement("li"), { textContent: "Notes unavailable.", className: "muted" })); return; }
+  paintNotesList();
+}
+function paintNotesList() {
+  const ul = document.getElementById("notesList");
+  const items = [];
+  for (const p of (NOTES_CACHE.plans || [])) items.push({ kind: "plan", label: "Plan " + p.time, data: p });
+  for (const doc of (NOTES_CACHE.docs || [])) items.push({ kind: "doc", label: doc.name, data: doc });
+  if (!items.length) { ul.replaceChildren(Object.assign(document.createElement("li"), { textContent: "No notes.", className: "muted" })); return; }
+  if (!NOTES_SEL || !items.some(i => i.label === NOTES_SEL)) NOTES_SEL = items[0].label;
+  ul.replaceChildren(...items.map(it => {
+    const li = document.createElement("li");
+    const b = document.createElement("button"); b.type = "button"; b.textContent = it.label;
+    if (it.label === NOTES_SEL) b.classList.add("on");
+    b.addEventListener("click", () => { NOTES_SEL = it.label; paintNotesList(); showNote(it); });
+    li.appendChild(b);
+    return li;
+  }));
+  const cur = items.find(i => i.label === NOTES_SEL) || items[0];
+  showNote(cur);
+}
+async function showNote(it) {
+  const pre = document.getElementById("notesPre"), meta = document.getElementById("notesMeta");
+  if (it.kind === "plan") {
+    meta.textContent = `${it.data.time} · ${it.data.reason || ""} · ${it.data.duration_min == null ? "in progress" : it.data.duration_min + " min"}`;
+    pre.replaceChildren();
+    const b = document.createElement("b"); b.textContent = "Plan " + it.data.time;
+    pre.append(b, document.createTextNode("\n\n" + (it.data.summary || "(no summary)")));
+    return;
+  }
+  meta.textContent = `${it.data.path} · ${it.data.mtime || ""}`;
+  let text = "";
+  try {
+    const r = await fetch("api/file?path=" + encodeURIComponent(it.data.path), { cache: "no-store" });
+    text = await r.text();
+  } catch (e) { text = "(could not load)"; }
+  pre.replaceChildren();
+  for (const line of text.split("\n")) {
+    if (/^#{1,6}\s/.test(line)) {
+      const b = document.createElement("b"); b.textContent = line.replace(/^#{1,6}\s*/, "");
+      pre.appendChild(b); pre.appendChild(document.createTextNode("\n"));
+    } else {
+      pre.appendChild(document.createTextNode(line + "\n"));
+    }
+  }
+}
+// ---- build / play
+async function refreshBuild() {
+  let b = null;
+  try { const r = await fetch("api/build", { cache: "no-store" }); if (r.ok) b = await r.json(); } catch (e) {}
+  const btn = document.getElementById("btnPlay"), txt = document.getElementById("buildText");
+  if (!b || !b.exe) { btn.hidden = true; txt.textContent = ""; return; }
+  const label = `Build from ${b.mtime || "?"}, ${b.tag || "untagged"}`;
+  if (STATE && STATE.manage && b.exists) {
+    btn.hidden = false;
+    btn.title = label;
+    txt.textContent = "";
+  } else {
+    btn.hidden = true;
+    txt.textContent = b.exists ? label : "";
+  }
+}
+document.getElementById("btnPlay").addEventListener("click", (e) => {
+  runAction(e.target, "api/control", { action: "play" });
+});
+const _renderSide2 = renderSide;
+renderSide = function (st) {
+  _renderSide2(st);
+  refreshBuild();
+  if (VIEW === "board") refreshBoard(true);
+  if (VIEW === "graph" && graphData) drawGraph();
+  if (VIEW === "stats" && !STATS_CACHE) refreshStats();
+};
+setView(["board", "graph", "stats", "notes"].includes(VIEW) ? VIEW : "office");
 if (/^T-\d+$/.test(DEEP.get("task") || "")) setTimeout(() => openDrawer(DEEP.get("task")), 600);

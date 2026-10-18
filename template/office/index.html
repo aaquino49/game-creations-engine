@@ -17,6 +17,8 @@
     <button id="viewOffice" type="button" class="vbtn on" aria-pressed="true">Office</button>
     <button id="viewBoard" type="button" class="vbtn" aria-pressed="false">Board</button>
     <button id="viewGraph" type="button" class="vbtn" aria-pressed="false">Graph</button>
+    <button id="viewStats" type="button" class="vbtn" aria-pressed="false">Stats</button>
+    <button id="viewNotes" type="button" class="vbtn" aria-pressed="false">Notes</button>
     <button id="btnTimeline" type="button">Timeline</button>
   </nav>
   <div class="pills">
@@ -35,27 +37,16 @@
     <span class="counts" id="counts"></span>
     <span class="clock" id="clock"></span>
   </div>
-    <label id="demoControl" hidden>Preview
-      <select id="scene" aria-label="Preview scene">
-        <option value="auto">Auto tour</option>
-        <option value="working">At work</option>
-        <option value="checks">Tests &amp; merges</option>
-        <option value="idle">Coffee break</option>
-        <option value="limits">Usage limits</option>
-        <option value="complete">Project complete</option>
-        <option value="closed">Office closed</option>
-      </select>
-    </label>
-    <span class="pill" id="pill">connecting…</span>
-    <span class="counts" id="counts"></span>
-    <span class="clock" id="clock"></span>
-  </div>
   <div class="controlbar" id="controlbar" hidden>
     <button id="btnPlan" type="button">Plan now</button>
     <button id="btnRestart" type="button">Restart</button>
-    <button id="btnStop" type="button">Stop</button>
+    <button id="btnStop" type="button" class="danger">Stop</button>
     <button id="btnStart" type="button" hidden>Start</button>
     <span class="chips" id="flagChips"></span>
+  </div>
+  <div class="buildbar" id="buildbar">
+    <button id="btnPlay" type="button" hidden>▶ Play</button>
+    <span class="muted" id="buildText"></span>
   </div>
 </header>
 
@@ -81,6 +72,22 @@
         <button id="gzIn" type="button" aria-label="Zoom in">+</button>
       </div>
       <div class="graphwrap" id="graphWrap"><svg id="graphSvg" role="img" aria-label="Task dependency graph"></svg></div>
+    </section>
+    <section class="panel statsview" id="statsView" hidden>
+      <div class="row btns">
+        <label>Window <select id="statsWindow" aria-label="Stats window">
+          <option value="6">6 h</option><option value="24" selected>24 h</option>
+          <option value="72">3 d</option><option value="168">7 d</option>
+        </select></label>
+        <label class="row"><input type="checkbox" id="statsAll"> this window</label>
+      </div>
+      <div id="statsBody"></div>
+    </section>
+    <section class="panel notesview" id="notesView" hidden>
+      <div class="notescols">
+        <ul class="noteslist" id="notesList"></ul>
+        <div class="notesdoc"><div class="muted" id="notesMeta"></div><pre class="prewrap" id="notesPre"></pre></div>
+      </div>
     </section>
   </section>
 

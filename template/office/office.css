@@ -313,3 +313,42 @@ select, input, textarea { font: inherit; background: var(--panel); color: var(--
   .boardcols { grid-template-columns: repeat(6, minmax(120px, 1fr)); }
   .drawer, .mbox { max-width: 100vw; }
 }
+
+/* phase 3: one shared button style (P2) + stats/notes/build */
+button {
+  font: inherit; font-size: 13px; background: var(--panel); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 6px; padding: 5px 12px; cursor: pointer;
+}
+button:hover { border-color: var(--accent); }
+button:disabled { opacity: .5; cursor: default; }
+button.danger, #dDrop, #btnStop { border-color: var(--bad); color: var(--bad); }
+.buildbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; flex-basis: 100%; padding-top: 6px; }
+/* P1: drawer close is a small square icon in the header's top-right */
+.dhead { position: relative; padding-right: 44px; }
+#drawerX {
+  position: absolute; top: 8px; right: 8px; width: 28px; height: 28px;
+  padding: 0; line-height: 1; font-size: 14px; text-align: center;
+}
+.statsview .chartwrap, .statsview .tablewrap, .notesview .notesdoc {
+  min-width: 0; max-width: 100%;
+}
+.statsview .tablewrap { overflow-x: auto; }
+.statsview svg.chart { width: 100%; height: auto; display: block; }
+.statsview table.grid { border-collapse: collapse; font-size: 12px; min-width: 560px; width: 100%; }
+.statsview table.grid th, .statsview table.grid td {
+  border: 1px solid var(--line); padding: 3px 8px; text-align: right; white-space: nowrap;
+}
+.statsview table.grid th:first-child, .statsview table.grid td:first-child { text-align: left; }
+.statsview .caption { color: var(--muted); font-size: 12px; margin: 4px 0 12px; }
+.statsview h3 { font-size: 13px; margin: 14px 0 6px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.meter { display: inline-block; width: 90px; height: 10px; background: var(--bar-bg); border-radius: 5px; overflow: hidden; vertical-align: middle; }
+.meter > span { display: block; height: 100%; background: var(--accent); }
+.notescols { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 10px; min-width: 0; }
+.noteslist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.noteslist button { text-align: left; width: 100%; }
+.noteslist button.on { background: var(--ink); color: var(--bg); }
+.notesdoc { min-width: 0; }
+@media (max-width: 500px) {
+  .notescols { grid-template-columns: minmax(0, 1fr); }
+  .statsview svg.chart { width: 100%; }
+}

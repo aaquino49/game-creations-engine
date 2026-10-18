@@ -13,6 +13,19 @@ Board and dependency-graph views, and manage-mode task actions via `project/comm
 status, retry, add-task, with pending chips). The orchestrator streams live logs and runs a command
 inbox watcher; the Office fixes the 390 px horizontal scroll.
 
+Phase 3: Stats and Notes views (Office | Board | Graph | Stats | Notes, `?view=` deep links),
+incidents, build and polish, demo coverage. Stats (`/api/stats?hours=6|24|72|168`, 30 s cache,
+offline hand-drawn SVG): agent scorecards/leaderboard with this-window toggle, DONE-per-hour and
+burndown charts with ETAs, lane Gantt with account-limit naps and a now line (bars open the drawer),
+FALLBACK routing flow, quota/Codex-meters/OpenCode-spend tables, and a paired supervisor incident log.
+Notes (`/api/notes` + `/api/file` extended to the notes docs and milestone reports only) shows every
+PLAN pair with duration plus the team reasoning docs. Build (`/api/build`, exe from `play.bat` else
+newest `builds/*.exe`, `git describe` tag) adds a manage-mode ▶ Play button that launches `play.bat`
+while the team runs. Polish: drawer ✕ is a small top-right icon, one shared button style (danger
+variant for Drop/Stop), done/in-progress drawers show the real disabled status with no Drop, graph
+nodes show id + ~18 chars of title. `--demo` returns seeded data (30 tasks, growing tail, 3 days of
+stats, notes, spend) for every Phase 2/3 read endpoint while keeping the timeline empty and POSTs 409.
+
 ## 1.1.0 (2026-10-18)
 
 Positions are roles now, not models. Agents are `quarterback` / `qa_lead` / `coder_1..5`;

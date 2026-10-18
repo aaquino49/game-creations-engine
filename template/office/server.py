@@ -49,8 +49,170 @@ _write_lock = threading.Lock()  # serialises read-modify-write of project files
 _probe = {"running": False, "results": {}}
 _probe_lock = threading.Lock()
 _shots: dict = {"t": 0.0, "data": []}
+_stats_cache: dict = {}  # hours -> {"t": float, "data": dict}
+_opencode: dict = {"t": 0.0, "days1": None, "days7": None, "error": "not loaded yet"}
+_opencode_lock = threading.Lock()
 TASK_ID_RE = re.compile(r"^T-\d+$")
 ALLOWED_SUFFIXES = {".png", ".json", ".log", ".md", ".patch", ".txt"}
+NOTES_FILES = {"project/decisions.md", "project/assumptions.md", "project/PM_NOTES.md"}
+
+
+def _stats_mod():
+    """Import the stats module (same folder) without breaking tests that stub it."""
+    try:
+        import stats as _st  # type: ignore
+        return _st
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def resolve_notes_file(rel: str) -> Path | None:
+    """Allow exactly project/decisions.md, project/assumptions.md,
+    project/PM_NOTES.md and project/milestones/*.md (single .md file, no traversal)."""
+    if not isinstance(rel, str) or not rel:
+        return None
+    norm = rel.replace("\\", "/")
+    if norm in NOTES_FILES:
+        try:
+            base = (ROOT / "project").resolve()
+            target = (ROOT / norm).resolve()
+            if base not in target.parents and target != base:
+                # decisions.md is directly under project/; allow parent == base
+                if target.parent != base:
+                    return None
+            if target.suffix.lower() != ".md":
+                return None
+            return target
+        except Exception:  # noqa: BLE001
+            return None
+    if norm.startswith("project/milestones/"):
+        rest = norm[len("project/milestones/"):]
+        if not rest or "/" in rest or "\\" in rest or ".." in rest:
+            return None
+        if not rest.endswith(".md") or rest.startswith("."):
+            return None
+        if not re.match(r"^[\w\-. ]+\.md$", rest):
+            return None
+        try:
+            base = (ROOT / "project" / "milestones").resolve()
+            target = (ROOT / norm).resolve()
+            if target.parent != base:
+                return None
+            return target
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def build_info() -> dict:
+    """{"exe", "exists", "mtime", "size_mb", "tag"}. Exe from play.bat else newest builds/*.exe."""
+    exe = None
+    try:
+        play = read(ROOT / "play.bat")
+        m = re.search(r"builds[\\/]([^\s\"'\)]+\.exe)", play, re.I)
+        if m:
+            exe = "builds/" + m.group(1).replace("\\", "/")
+    except Exception:  # noqa: BLE001
+        exe = None
+    if not exe:
+        try:
+            cands = [p for p in (ROOT / "builds").glob("*.exe") if p.is_file()] if (ROOT / "builds").is_dir() else []
+            if cands:
+                best = max(cands, key=lambda p: p.stat().st_mtime)
+                exe = "builds/" + best.name
+        except OSError:
+            pass
+    exists, mtime, size_mb = False, "", 0.0
+    if exe:
+        try:
+            p = ROOT / exe
+            if p.is_file():
+                exists = True
+                st = p.stat()
+                mtime = dt.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+                size_mb = round(st.st_size / (1024 * 1024), 1)
+        except OSError:
+            exists = False
+    tag = ""
+    try:
+        r = subprocess.run(["git", "describe", "--tags", "--abbrev=0"], cwd=ROOT,
+                           capture_output=True, text=True, timeout=10,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode == 0:
+            tag = (r.stdout or "").strip().splitlines()[0][:100] if (r.stdout or "").strip() else ""
+    except Exception:  # noqa: BLE001
+        tag = ""
+    return {"exe": exe, "exists": exists, "mtime": mtime, "size_mb": size_mb, "tag": tag}
+
+
+def opencode_snapshot() -> dict:
+    with _opencode_lock:
+        return {"days1": _opencode.get("days1"), "days7": _opencode.get("days7"),
+                "error": _opencode.get("error"), "updated": _opencode.get("t", 0.0)}
+
+
+def _run_opencode_once() -> None:
+    st = _stats_mod()
+    exe = shutil.which("opencode")
+    if not exe:
+        with _opencode_lock:
+            _opencode.update({"days1": None, "days7": None, "error": "opencode not found"})
+        return
+    out: dict = {}
+    err = None
+    for key, days in (("days1", "1"), ("days7", "7")):
+        try:
+            r = subprocess.run([exe, "stats", "--days", days, "--models", "--project", ""], cwd=ROOT,
+                               capture_output=True, text=True, timeout=60, encoding="utf-8",
+                               errors="replace",
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if r.returncode != 0:
+                err = f"opencode exited {r.returncode}"
+                out[key] = None
+                continue
+            parsed = st.parse_opencode_stats(r.stdout) if st else {"total": None, "models": {}}
+            if parsed.get("total") is None and not parsed.get("models"):
+                err = "could not parse opencode output"
+            out[key] = parsed
+        except Exception as e:  # noqa: BLE001
+            err = str(e)[:200]
+            out[key] = None
+    with _opencode_lock:
+        _opencode.update({"t": time.time(), "days1": out.get("days1"),
+                          "days7": out.get("days7"),
+                          "error": err if (out.get("days1") is None and out.get("days7") is None) else None})
+
+
+def ensure_opencode() -> None:
+    """Refresh opencode stats in a background thread at most every 10 min."""
+    with _opencode_lock:
+        stale = time.time() - float(_opencode.get("t", 0.0)) > 600
+    if stale:
+        threading.Thread(target=_run_opencode_once, daemon=True).start()
+
+
+def cached_stats(hours: int) -> dict:
+    st = _stats_mod()
+    now = dt.datetime.now()
+    key = (str(ROOT), hours)
+    with _lock:
+        ent = _stats_cache.get(key)
+        if ent and time.time() - ent["t"] < 30:
+            return ent["data"]
+    data = st.build_stats(ROOT, now, hours) if st else {"hours": hours}
+    try:
+        data["codex"] = st.codex_usage() if st else None
+    except Exception:  # noqa: BLE001
+        data["codex"] = None
+    try:
+        data["paid_models"] = sorted(st._paid_models(ROOT)) if st and hasattr(st, "_paid_models") else []
+    except Exception:  # noqa: BLE001
+        data["paid_models"] = []
+    ensure_opencode()
+    data["opencode"] = opencode_snapshot()
+    with _lock:
+        _stats_cache[key] = {"t": time.time(), "data": data}
+    return data
 
 
 def process_status(commands: list[str], script: str) -> bool | None:
@@ -851,14 +1013,22 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, json.dumps(state()).encode("utf-8"), "application/json")
         if path == "/api/board":
             if DEMO:
-                return self.send(200, json.dumps({"tasks": [], "milestones": []}).encode("utf-8"),
+                from demo import demo_board
+                return self.send(200, json.dumps(demo_board()).encode("utf-8"),
                                   "application/json")
             if MANAGE and not host_allowed(self.headers.get("Host", "")):
                 return self.deny(403, "bad host")
             return self.send(200, json.dumps(board_summary()).encode("utf-8"), "application/json")
         if path.startswith("/api/task/"):
             if DEMO:
-                return self.deny(404, "unknown task")
+                from demo import demo_board, demo_task
+                tid = path[len("/api/task/"):]
+                if not re.match(r"^T-\d+$", tid):
+                    return self.deny(400, "bad task id")
+                b = demo_board()
+                if not any(t["id"] == tid for t in b["tasks"]):
+                    return self.deny(404, "unknown task")
+                return self.send(200, json.dumps(demo_task(tid)).encode("utf-8"), "application/json")
             if MANAGE and not host_allowed(self.headers.get("Host", "")):
                 return self.deny(403, "bad host")
             tid = path[len("/api/task/"):]
@@ -870,11 +1040,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, json.dumps(detail).encode("utf-8"), "application/json")
         if path == "/api/file":
             if DEMO:
-                return self.deny(404, "not found")
+                from demo import demo_file
+                relp = (qs.get("path", [""])[0] or "")
+                if relp.endswith(".png"):
+                    return self.send(200, b"\x89PNG\r\n\x1a\ndemo", "image/png")
+                text = demo_file(relp)
+                if not text:
+                    text = f"# Demo file\n\nSimulated content for {relp}.\n"
+                return self.send(200, text.encode("utf-8"), "text/markdown")
             if MANAGE and not host_allowed(self.headers.get("Host", "")):
                 return self.deny(403, "bad host")
             relp = (qs.get("path", [""])[0] or "")
-            target = resolve_office_file(relp)
+            target = resolve_office_file(relp) or resolve_notes_file(relp)
             if target is None:
                 return self.deny(403, "forbidden")
             if not target.is_file():
@@ -897,7 +1074,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.deny(403, "forbidden")
         if path == "/api/tail":
             if DEMO:
-                return self.deny(404, "not found")
+                from demo import demo_tail
+                relp = (qs.get("path", [""])[0] or "")
+                off_raw = (qs.get("offset", ["0"])[0] or "0")
+                try:
+                    offset = int(off_raw)
+                    if offset < 0:
+                        raise ValueError()
+                except ValueError:
+                    return self.deny(400, "bad offset")
+                return self.send(200, json.dumps(demo_tail(relp, offset)).encode("utf-8"),
+                                  "application/json")
             if MANAGE and not host_allowed(self.headers.get("Host", "")):
                 return self.deny(403, "bad host")
             relp = (qs.get("path", [""])[0] or "")
@@ -949,7 +1136,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, json.dumps(screenshots_list()).encode("utf-8"), "application/json")
         if path == "/api/commands":
             if DEMO:
-                return self.send(200, json.dumps({"pending": [], "done": []}).encode("utf-8"),
+                return self.send(200, json.dumps(
+                    {"pending": [{"id": "demo1", "action": "set_priority", "task": "T-2"}],
+                     "done": [{"id": "demo0", "action": "set_priority", "task": "T-1", "result": "applied"}]}).encode("utf-8"),
                                   "application/json")
             if not self.check_manage():
                 return
@@ -978,9 +1167,55 @@ class Handler(BaseHTTPRequestHandler):
                     continue
             return self.send(200, json.dumps({"pending": pending, "done": done}).encode("utf-8"),
                               "application/json")
+        if path == "/api/stats":
+            if DEMO:
+                from demo import demo_stats
+                hours_raw = (qs.get("hours", ["24"])[0] or "24")
+                try:
+                    hours = int(hours_raw)
+                except ValueError:
+                    return self.deny(400, "bad hours")
+                if hours not in (6, 24, 72, 168):
+                    return self.deny(400, "bad hours")
+                return self.send(200, json.dumps(demo_stats(hours)).encode("utf-8"), "application/json")
+            if MANAGE and not host_allowed(self.headers.get("Host", "")):
+                return self.deny(403, "bad host")
+            hours_raw = (qs.get("hours", ["24"])[0] or "24")
+            try:
+                hours = int(hours_raw)
+            except ValueError:
+                return self.deny(400, "bad hours")
+            if hours not in (6, 24, 72, 168):
+                return self.deny(400, "bad hours")
+            try:
+                return self.send(200, json.dumps(cached_stats(hours)).encode("utf-8"), "application/json")
+            except Exception as e:  # noqa: BLE001
+                return self.deny(500, f"stats failed: {e}"[:200])
+        if path == "/api/notes":
+            if DEMO:
+                from demo import demo_notes
+                return self.send(200, json.dumps(demo_notes()).encode("utf-8"), "application/json")
+            if MANAGE and not host_allowed(self.headers.get("Host", "")):
+                return self.deny(403, "bad host")
+            st = _stats_mod()
+            try:
+                data = st.build_notes(ROOT) if st else {"plans": [], "docs": []}
+            except Exception:  # noqa: BLE001
+                data = {"plans": [], "docs": []}
+            return self.send(200, json.dumps(data).encode("utf-8"), "application/json")
+        if path == "/api/build":
+            if DEMO:
+                from demo import demo_build
+                return self.send(200, json.dumps(demo_build()).encode("utf-8"), "application/json")
+            if MANAGE and not host_allowed(self.headers.get("Host", "")):
+                return self.deny(403, "bad host")
+            return self.send(200, json.dumps(build_info()).encode("utf-8"), "application/json")
         if path in ("/api/requests", "/api/probe"):
             if DEMO:
-                stub = {"open": [], "handled": []} if path == "/api/requests" else {"running": False, "results": {}}
+                if path == "/api/requests":
+                    stub = {"open": ["Demo: add a fishing rod"], "handled": ["Demo: menu polish (T-1)"]}
+                else:
+                    stub = {"running": False, "results": {"coder_1": {"state": "ok", "seconds": 1.2, "detail": "OK"}}}
                 return self.send(200, json.dumps(stub).encode("utf-8"), "application/json")
             if not self.check_manage():
                 return
@@ -1085,6 +1320,8 @@ class Handler(BaseHTTPRequestHandler):
         elif action == "start_supervisor":
             if _procs.get("supervisor") is not True:
                 subprocess.Popen(["cmd", "/c", "start", "", "supervise.bat"], cwd=ROOT)
+        elif action == "play":
+            subprocess.Popen(["cmd", "/c", "start", "", "play.bat"], cwd=ROOT)
         else:
             return self.deny(400, "unknown action")
         invalidate()
