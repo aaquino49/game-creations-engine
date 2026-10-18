@@ -52,7 +52,13 @@ _shots: dict = {"t": 0.0, "data": []}
 _stats_cache: dict = {}  # hours -> {"t": float, "data": dict}
 _opencode: dict = {"t": 0.0, "days1": None, "days7": None, "error": "not loaded yet"}
 _opencode_lock = threading.Lock()
+_models: dict = {"t": 0.0, "data": []}  # `opencode models` list, cached for 1 h
+_models_lock = threading.Lock()
 TASK_ID_RE = re.compile(r"^T-\d+$")
+MODEL_ID_RE = re.compile(r"^[\w.][\w./:@-]{0,99}$")  # no leading "-": it would read as a CLI flag
+AGENT_ID_RE = re.compile(r"^[a-z][a-z0-9_]{1,30}$")
+ACCOUNT_ID_RE = re.compile(r"^[\w-]{1,40}$")
+FALLBACK_STEPS = {"*", "work", "qa", "plan", "review", "work-qa", "work-asset"}
 ALLOWED_SUFFIXES = {".png", ".json", ".log", ".md", ".patch", ".txt"}
 NOTES_FILES = {"project/decisions.md", "project/assumptions.md", "project/PM_NOTES.md"}
 
@@ -269,6 +275,478 @@ def office_event(msg: str) -> None:
         f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
 
 
+# ----------------------------------------------------------------------------- settings (config.json editor)
+
+def config_path() -> Path:
+    return ROOT / "orchestrator" / "config.json"
+
+
+def config_mtime() -> float:
+    try:
+        return config_path().stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def read_config() -> dict | None:
+    return read_json(config_path())
+
+
+def _run_models_once() -> None:
+    exe = shutil.which("opencode")
+    if not exe:
+        with _models_lock:
+            _models.update({"t": time.time(), "data": []})
+        return
+    try:
+        r = subprocess.run([exe, "models"], cwd=HERE, capture_output=True, text=True,
+                           timeout=60, encoding="utf-8", errors="replace",
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode != 0:
+            raise RuntimeError(f"opencode models exited {r.returncode}")
+        out = r.stdout or ""
+        found = sorted({m for m in re.findall(r"[\w./:@-]{1,100}", out) if "/" in m})
+        with _models_lock:
+            _models.update({"t": time.time(), "data": found})
+    except Exception:  # noqa: BLE001
+        with _models_lock:
+            _models.update({"t": time.time(), "data": []})
+
+
+def models_list() -> list:
+    """`opencode models` output cached for 1 h, refreshed in a background thread."""
+    with _models_lock:
+        stale = time.time() - float(_models.get("t", 0.0)) > 3600
+        data = list(_models.get("data") or [])
+    if stale:
+        threading.Thread(target=_run_models_once, daemon=True).start()
+    return data
+
+
+def agent_paid(cfg: dict, name: str) -> bool:
+    return name in (cfg.get("paid_agents") or cfg.get("paid") or [])
+
+
+def agent_kind(cfg: dict, name: str) -> str:
+    a = (cfg.get("agents") or {}).get(name) or {}
+    kind = a.get("kind")
+    if kind:
+        return kind
+    cmd = a.get("cmd") or []
+    return cmd[0] if cmd else "?"
+
+
+def build_cmd_for_kind(kind: str, model: str, agents: dict) -> list | None:
+    """New positions copy the cmd of an existing agent of the same kind (model replaced);
+    with none of that kind, build it the way scaffold.py does."""
+    for _n, a in agents.items():
+        if (a or {}).get("kind") == kind and isinstance((a or {}).get("cmd"), list):
+            cmd = list(a["cmd"])
+            for flag in ("-m", "--model"):
+                if flag in cmd:
+                    cmd[cmd.index(flag) + 1] = model
+                    return cmd
+    if kind == "claude":
+        return ["claude", "-p", "{prompt}", "--model", model, "--dangerously-skip-permissions"]
+    if kind == "codex":
+        return ["codex", "exec", "-m", model, "--dangerously-bypass-approvals-and-sandbox",
+                "--skip-git-repo-check", "{prompt}", "{images}"]
+    if kind == "opencode":
+        return ["opencode", "run", "--auto", "--print-logs", "--log-level", "ERROR",
+                "-m", model, "{prompt}"]
+    return None
+
+
+def set_model_in_cmd(cmd: list, model: str) -> list | None:
+    """Replace only the value after -m / --model. None when the cmd has no such flag."""
+    cmd = list(cmd)
+    for flag in ("-m", "--model"):
+        if flag in cmd:
+            i = cmd.index(flag)
+            if i + 1 < len(cmd):
+                cmd[i + 1] = model
+                return cmd
+    return None
+
+
+class ConfigError(Exception):
+    def __init__(self, code: int, msg: str):
+        super().__init__(msg)
+        self.code = code
+        self.msg = msg
+
+
+def validate_whole_config(cfg: dict) -> None:
+    """Every agent named in coders, paid_agents, roles, fallback chains and disabled_agents
+    exists; chains have no duplicates; at least one coder; lanes within limits."""
+    agents = cfg.get("agents") or {}
+    if not isinstance(agents, dict):
+        raise ConfigError(400, "agents must be an object")
+    for name in cfg.get("coders") or []:
+        if name not in agents:
+            raise ConfigError(400, f"unknown coder {name}")
+    if not (cfg.get("coders") or []):
+        raise ConfigError(400, "at least one coder is required")
+    for name in cfg.get("paid_agents") or cfg.get("paid") or []:
+        if name not in agents:
+            raise ConfigError(400, f"unknown paid agent {name}")
+    for _role, name in (cfg.get("roles") or {}).items():
+        if name not in agents:
+            raise ConfigError(400, f"unknown role holder {name}")
+    for name in cfg.get("disabled_agents") or []:
+        if name not in agents:
+            raise ConfigError(400, f"unknown disabled agent {name}")
+    fb = cfg.get("fallback") or {}
+    if not isinstance(fb, dict):
+        raise ConfigError(400, "fallback must be an object")
+    for key, chain in fb.items():
+        if not isinstance(key, str) or ":" not in key:
+            raise ConfigError(400, f"bad fallback key {key}")
+        holder, _, step = key.partition(":")
+        if holder not in agents:
+            raise ConfigError(400, f"unknown fallback holder {holder}")
+        if step not in FALLBACK_STEPS:
+            raise ConfigError(400, f"bad fallback step {step}")
+        if not isinstance(chain, list):
+            raise ConfigError(400, f"bad fallback chain {key}")
+        if len(set(chain)) != len(chain):
+            raise ConfigError(400, f"duplicate agent in {key}")
+        for member in chain:
+            if member not in agents:
+                raise ConfigError(400, f"unknown fallback agent {member}")
+    lanes = cfg.get("lanes") or []
+    if not isinstance(lanes, list):
+        raise ConfigError(400, "lanes must be a list")
+    if len(lanes) > 5:
+        raise ConfigError(400, "at most 5 worktree lanes (6 total)")
+    names = [str(e.get("name", "")).upper() for e in lanes if isinstance(e, dict)]
+    if len(set(names)) != len(names):
+        raise ConfigError(400, "duplicate lane names")
+    for e in lanes:
+        if not isinstance(e, dict) or not e.get("name") or not e.get("dir"):
+            raise ConfigError(400, "lanes need {name, dir}")
+
+
+def busy_agents() -> set:
+    """Agents currently busy on a lane (per /api/state jobs)."""
+    try:
+        st = build_state()
+    except Exception:  # noqa: BLE001
+        return set()
+    out = set()
+    for job in st.get("jobs") or []:
+        if job.get("agent"):
+            out.add(job["agent"])
+    return out
+
+
+def busy_lane_letters() -> set:
+    try:
+        st = build_state()
+    except Exception:  # noqa: BLE001
+        return set()
+    return {str(l.get("lane", "")).upper() for l in st.get("lanes") or [] if l.get("state") == "busy"}
+
+
+def apply_config_changes(cfg: dict, changes: dict) -> tuple[dict, str, bool]:
+    """Apply a changes dict to cfg (mutates a copy). Returns (new_cfg, summary, restart_needed).
+    Raises ConfigError(code, msg)."""
+    import copy
+    if not isinstance(changes, dict):
+        raise ConfigError(400, "changes must be an object")
+    new = copy.deepcopy(cfg)
+    new.setdefault("agents", {})
+    agents = new["agents"]
+    parts: list[str] = []
+    restart = False
+
+    for rid in changes.get("remove") or []:
+        if rid not in agents:
+            raise ConfigError(400, f"unknown agent {rid}")
+        roles = new.get("roles") or {}
+        if rid in roles.values():
+            raise ConfigError(409, f"{rid} holds a role")
+        if rid in (new.get("coders") or []) and len(new.get("coders") or []) <= 1:
+            raise ConfigError(409, "cannot remove the only coder")
+        if rid in busy_agents():
+            raise ConfigError(409, f"{rid} is busy")
+        del agents[rid]
+        new["coders"] = [c for c in new.get("coders") or [] if c != rid]
+        for key in ("paid_agents", "paid"):
+            if key in new and isinstance(new[key], list):
+                new[key] = [c for c in new[key] if c != rid]
+        new["disabled_agents"] = [c for c in new.get("disabled_agents") or [] if c != rid]
+        fb = new.get("fallback") or {}
+        for key in list(fb):
+            holder, _, _step = key.partition(":")
+            if holder == rid:
+                del fb[key]
+            elif isinstance(fb[key], list) and rid in fb[key]:
+                fb[key] = [c for c in fb[key] if c != rid]
+        parts.append(f"remove {rid}")
+        restart = True
+
+    for spec in changes.get("add") or []:
+        if not isinstance(spec, dict):
+            raise ConfigError(400, "bad add spec")
+        nid = spec.get("id", "")
+        kind = spec.get("kind", "")
+        model = spec.get("model", "")
+        account = spec.get("account", "")
+        label = spec.get("label", "")
+        if not isinstance(nid, str) or not AGENT_ID_RE.match(nid):
+            raise ConfigError(400, f"bad agent id {nid}")
+        if nid in agents:
+            raise ConfigError(400, f"duplicate agent id {nid}")
+        if kind not in ("opencode", "claude", "codex"):
+            raise ConfigError(400, f"bad kind {kind}")
+        if not isinstance(model, str) or not MODEL_ID_RE.match(model):
+            raise ConfigError(400, f"bad model id {model}")
+        if not isinstance(account, str) or not ACCOUNT_ID_RE.match(account):
+            raise ConfigError(400, f"bad account id {account}")
+        if label is not None and (not isinstance(label, str) or len(label) > 40):
+            raise ConfigError(400, "bad label")
+        cmd = build_cmd_for_kind(kind, model, agents)
+        if not cmd:
+            raise ConfigError(400, f"cannot build cmd for kind {kind}")
+        agents[nid] = {"cmd": cmd, "kind": kind, "model": model,
+                       "account": account, "label": label or nid.replace("_", " ").title()}
+        if kind == "opencode":
+            agents[nid]["watch_rate_limit"] = True  # as scaffold.py: OpenCode retries limits silently
+        parts.append(f"add {nid}")
+        restart = True
+
+    for aid, fields in (changes.get("agents") or {}).items():
+        if aid not in agents:
+            raise ConfigError(400, f"unknown agent {aid}")
+        if not isinstance(fields, dict):
+            raise ConfigError(400, f"bad fields for {aid}")
+        a = agents[aid]
+        if "model" in fields:
+            model = fields["model"]
+            if not isinstance(model, str) or not MODEL_ID_RE.match(model):
+                raise ConfigError(400, f"bad model id {model}")
+            cmd = a.get("cmd")
+            if not isinstance(cmd, list) or set_model_in_cmd(cmd, model) is None:
+                raise ConfigError(400, f"{aid} has no -m flag; model is read-only")
+            a["cmd"] = set_model_in_cmd(cmd, model)
+            a["model"] = model
+            parts.append(f"model {aid}")
+            restart = True
+        if "account" in fields:
+            account = fields["account"]
+            if not isinstance(account, str) or not ACCOUNT_ID_RE.match(account):
+                raise ConfigError(400, f"bad account id {account}")
+            a["account"] = account
+            parts.append(f"account {aid}")
+            restart = True
+        if "label" in fields:
+            label = fields["label"]
+            if not isinstance(label, str) or len(label) > 40:
+                raise ConfigError(400, "bad label")
+            a["label"] = label
+            parts.append(f"label {aid}")
+        if "coder" in fields:
+            want = bool(fields["coder"])
+            coders_now = list(new.get("coders") or [])
+            if want and aid not in coders_now:
+                coders_now.append(aid)
+                parts.append(f"coder +{aid}")
+                restart = True
+            elif not want and aid in coders_now:
+                if len(coders_now) <= 1:
+                    raise ConfigError(409, "cannot remove the only coder")
+                coders_now.remove(aid)
+                parts.append(f"coder -{aid}")
+                restart = True
+            new["coders"] = coders_now
+        if "paid" in fields:
+            want = bool(fields["paid"])
+            paid = list(new.get("paid_agents") or new.get("paid") or [])
+            if want and aid not in paid:
+                paid.append(aid)
+                parts.append(f"paid +{aid}")
+                restart = True
+            elif not want and aid in paid:
+                paid = [p for p in paid if p != aid]
+                parts.append(f"paid -{aid}")
+                restart = True
+            new["paid_agents"] = paid
+            new.pop("paid", None)
+
+    if "coders" in changes:
+        order = changes["coders"]
+        if not isinstance(order, list) or set(order) != set(new.get("coders") or []) or len(order) != len(new.get("coders") or []):
+            raise ConfigError(400, "bad coder order")
+        for c in order:
+            if c not in agents:
+                raise ConfigError(400, f"unknown coder {c}")
+        new["coders"] = list(order)
+        parts.append("reorder coders")
+        restart = True
+
+    if "fallback" in changes:
+        fb = changes["fallback"]
+        if not isinstance(fb, dict):
+            raise ConfigError(400, "bad fallback")
+        new["fallback"] = {k: list(v) for k, v in fb.items()}
+        parts.append("fallbacks")
+        restart = True
+
+    if "lanes" in changes:
+        spec = changes["lanes"]
+        if not isinstance(spec, dict) or "count" not in spec:
+            raise ConfigError(400, "bad lanes")
+        try:
+            count = int(spec["count"])
+        except (TypeError, ValueError):
+            raise ConfigError(400, "bad lanes")
+        if count < 1 or count > 6:
+            raise ConfigError(400, "lanes must be 1-6")
+        cur = list(new.get("lanes") or [])
+        want_worktrees = max(0, count - 1)
+        if len(cur) < want_worktrees:
+            last_dir = cur[-1].get("dir", "") if cur else ""
+            if last_dir:
+                m = re.search(r"^(.*)([A-Za-z])$", last_dir.rstrip("/"))
+                nxt = chr(ord("B") + len(cur))
+                new_dir = (m.group(1) + nxt) if m else last_dir + nxt
+            else:
+                new_dir = spec.get("new_dir", "")
+                if not new_dir or not os.path.isabs(new_dir):
+                    raise ConfigError(400, "a dir is required (absolute path)")
+                if "OneDrive" in new_dir:
+                    raise ConfigError(400, "lane dirs must be outside OneDrive (Windows path limit and file locking)")
+                nxt = chr(ord("B") + len(cur))
+            for i in range(len(cur), want_worktrees):
+                letter = chr(ord("B") + i)
+                if i == len(cur) and not last_dir:
+                    cur.append({"name": letter, "dir": new_dir})
+                elif i == len(cur) and last_dir:
+                    cur.append({"name": letter, "dir": new_dir})
+                else:
+                    prev = cur[-1]["dir"]
+                    m2 = re.search(r"^(.*)([A-Za-z])$", prev.rstrip("/"))
+                    nxt_dir = (m2.group(1) + letter) if m2 else prev + letter
+                    cur.append({"name": letter, "dir": nxt_dir})
+            void = spec.get("new_dir")
+            if void and not last_dir and cur:
+                if "OneDrive" in str(void):
+                    raise ConfigError(400, "lane dirs must be outside OneDrive (Windows path limit and file locking)")
+            parts.append(f"lanes {1 + len(new.get('lanes') or [])}→{count}")
+        elif len(cur) > want_worktrees:
+            if len(cur) - want_worktrees > 0:
+                last = cur[-1].get("name", "").upper()
+                if last in busy_lane_letters():
+                    raise ConfigError(409, f"lane {last} is busy")
+                cur = cur[:want_worktrees]
+            parts.append(f"lanes {1 + len(new.get('lanes') or [])}→{count}")
+        new["lanes"] = cur
+        restart = True
+
+    if "approval_gate" in changes:
+        ag = changes["approval_gate"]
+        if not isinstance(ag, dict):
+            raise ConfigError(400, "bad approval_gate")
+        gate = {"enabled": bool(ag.get("enabled", False)),
+                "types": list(ag.get("types") or []),
+                "workers": list(ag.get("workers") or []),
+                "timeout_minutes": ag.get("timeout_minutes", 0)}
+        try:
+            gate["timeout_minutes"] = float(gate["timeout_minutes"] or 0)
+        except (TypeError, ValueError):
+            raise ConfigError(400, "bad timeout_minutes")
+        for w in gate["workers"]:
+            if w not in agents:
+                raise ConfigError(400, f"unknown gate worker {w}")
+        new["approval_gate"] = gate
+        parts.append("approval gate")
+        restart = True
+
+    if "spend_cap" in changes:
+        sc = changes["spend_cap"]
+        if not isinstance(sc, dict):
+            raise ConfigError(400, "bad spend_cap")
+        try:
+            daily = float(sc.get("daily_usd", 0) or 0)
+        except (TypeError, ValueError):
+            raise ConfigError(400, "bad daily_usd")
+        members = list(sc.get("agents") or [])
+        for m in members:
+            if m not in agents:
+                raise ConfigError(400, f"unknown spend cap agent {m}")
+        new["spend_cap"] = {"daily_usd": daily, "agents": members}
+        parts.append("spend cap")
+        restart = True
+
+    # Whole-config validation: every reference must still resolve.
+    try:
+        validate_whole_config(new)
+    except ConfigError:
+        raise
+    # Extra removal rule: an agent referenced in a chain must also be removed from the chain.
+    # apply_config_changes already cleans chains on remove; a direct fallback edit that drops an
+    # agent definition without cleaning is caught by validate_whole_config (unknown agent).
+    # But removing the only coder / a role holder / a chain member without cleaning via a raw
+    # fallback+agents edit is refused here when inconsistent.
+    return new, ", ".join(parts) or "no changes", restart
+
+
+def write_config_file(new_cfg: dict, raw_before: str) -> float:
+    """Backup (newest 20), atomic write with indent=2. Returns the new mtime."""
+    backup_dir = config_path().parent / "config.backups"
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        (backup_dir / f"config-{stamp}.json").write_text(raw_before, encoding="utf-8")
+        existing = sorted(backup_dir.glob("config-*.json"), key=lambda p: p.name)
+        for old in existing[:-20]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+    text = json.dumps(new_cfg, indent=2)
+    tmp = config_path().with_name(config_path().name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, config_path())
+    try:
+        ts = config_mtime()
+        os.utime(config_path(), (ts, ts))
+    except OSError:
+        pass
+    return config_mtime()
+
+
+# ----------------------------------------------------------------------------- approvals (human-in-the-loop gate)
+
+def approvals_dir() -> Path:
+    return ROOT / "project" / "approvals"
+
+
+def list_approvals() -> list:
+    """Pending approval requests (read-only)."""
+    d = approvals_dir()
+    out = []
+    try:
+        files = sorted(d.glob("*.json")) if d.is_dir() else []
+    except OSError:
+        return []
+    for p in files:
+        if p.name.endswith(".decision.json") or (d / "done" / p.name).exists():
+            continue
+        if (d / f"{p.stem}.decision.json").exists():
+            continue
+        try:
+            req = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(req, dict):
+            out.append(req)
+    return out
+
+
 def host_allowed(host: str) -> bool:
     """DNS-rebinding guard: only localhost (or the LAN IP with --lan) may use the API in manage mode."""
     name = (host or "").strip().lower()
@@ -458,7 +936,9 @@ def classify(text: str) -> dict:
     for prefix, kind in (("MILESTONE", "milestone"), ("PROJECT COMPLETE", "complete"), ("PLAN start", "plan_start"),
                          ("PLAN done", "plan_done"), ("USAGE LIMIT", "limit"), ("QUOTA RESTORED", "restored"),
                          ("FALLBACK", "fallback"), ("SUPERVISOR", "supervisor"), ("PROVIDER DOWN", "limit"),
-                         ("PREEMPTIVE HANDOFF", "limit"), ("MODEL GONE", "gone"),
+                         ("PREEMPTIVE HANDOFF", "limit"), ("MODEL GONE", "gone"), ("SPEND CAP", "limit"),
+                         ("BENCH", "bench"), ("UNBENCH", "bench"), ("APPROVAL WAIT", "approval"),
+                         ("APPROVAL TIMEOUT", "approval"), ("APPROVAL", "approval"),
                          ("RESTART", "restart"), ("ORCHESTRATOR START", "boot")):
         if text.startswith(prefix):
             return {"kind": kind}
@@ -696,8 +1176,23 @@ def screenshots_list() -> list:
 def validate_command(data: dict, board: dict) -> tuple[int, str]:
     """(code, error). 0 means valid. Mirrors the orchestrator inbox rules."""
     action = data.get("action", "")
-    if action not in ("set_priority", "set_status", "retry", "add_task"):
+    if action not in ("set_priority", "set_status", "retry", "add_task",
+                      "bench", "unbench", "set_approval"):
         return 400, "unknown action"
+    if action in ("bench", "unbench"):
+        ag = data.get("agent")
+        if not isinstance(ag, str) or not ag:
+            return 400, "agent required"
+        return 0, ""
+    if action == "set_approval":
+        tid, req = data.get("task"), data.get("required")
+        if not isinstance(tid, str) or not TASK_ID_RE.match(tid):
+            return 400, "bad task"
+        if not next((t for t in board.get("tasks", []) if t.get("id") == tid), None):
+            return 400, "unknown task"
+        if not isinstance(req, bool):
+            return 400, "bad required"
+        return 0, ""
     if action == "set_priority":
         tid, prio = data.get("task"), data.get("priority")
         if not isinstance(tid, str) or prio is None:
@@ -783,7 +1278,7 @@ def limits(events: list[str], agents: dict) -> dict:
     out: dict = {}
     now = dt.datetime.now()
     for line in events:
-        m = re.match(r"(\S+ \S+)\s+(USAGE LIMIT|PROVIDER DOWN|MODEL GONE|PREEMPTIVE HANDOFF|QUOTA RESTORED) ([\w-]+)", line)
+        m = re.match(r"(\S+ \S+)\s+(USAGE LIMIT|SPEND CAP|PROVIDER DOWN|MODEL GONE|PREEMPTIVE HANDOFF|QUOTA RESTORED|BENCH|UNBENCH) ([\w-]+)", line)
         if not m:
             continue
         when = parse_time(m.group(1))
@@ -792,11 +1287,13 @@ def limits(events: list[str], agents: dict) -> dict:
         if m.group(2) == "QUOTA RESTORED":
             out = {k: v for k, v in out.items() if account.get(k) != m.group(3) and k != m.group(3)}
             continue
-        u = re.search(r"until ~(?:\w{3} )?(\d{1,2}):(\d{2})", line)
+        if m.group(2) in ("BENCH", "UNBENCH"):
+            continue  # bench state comes from config.json, not events
+        u = re.search(r"until ~?(?:\w{3} )?(\d{1,2}):(\d{2})", line)
         until = when.replace(hour=int(u.group(1)), minute=int(u.group(2)), second=0) if u else when + dt.timedelta(hours=1)
         if until < when:
             until += dt.timedelta(days=1)
-        kind = {"USAGE LIMIT": "limited", "PREEMPTIVE HANDOFF": "limited",
+        kind = {"USAGE LIMIT": "limited", "SPEND CAP": "limited", "PREEMPTIVE HANDOFF": "limited",
                 "PROVIDER DOWN": "down", "MODEL GONE": "gone"}[m.group(2)]
         subject = m.group(3)
         if kind == "limited":  # handoffs name an account; usage limits name an agent
@@ -892,12 +1389,16 @@ def build_state() -> dict:
     last_sup = next((EVENT_RE.match(l).group(2) for l in reversed(tail) if "SUPERVISOR" in l and EVENT_RE.match(l)), "")
 
     lim = limits(tail, agents)
+    benched_set = set(cfg.get("disabled_agents") or [])
     agent_list = []
     for n, a in agents.items():
         kind = (a.get("cmd") or ["?"])[0]
         label = a.get("label") or next((l for l, x in labels.items() if x == n and l != n), n)
         agent_list.append({"id": n, "label": label, "tool": kind, "model": a.get("model", ""),
-                           "paid": n in (cfg.get("paid_agents") or []), "coder": n in (cfg.get("coders") or []),
+                           "kind": a.get("kind", kind), "account": a.get("account", n),
+                           "paid": n in (cfg.get("paid_agents") or cfg.get("paid") or []),
+                           "coder": n in (cfg.get("coders") or []),
+                           "benched": n in benched_set,
                            **({"limit": lim[n]} if n in lim else {})})
 
     # Subscriptions (usage-limit buckets): every account in play, worst state first. Shared by
@@ -944,6 +1445,10 @@ def build_state() -> dict:
 
     flags = [f for f in ("STOP", "RESTART", "PLAN_NOW") if (p / f).exists()]
     game = (re.search(r"^# (.+?): Live Status", status, re.M) or [None, board.get("project") or ROOT.name])[1]
+    try:
+        pending_approvals = list_approvals()
+    except Exception:  # noqa: BLE001
+        pending_approvals = []
     return {
         "game": game, "time": dt.datetime.now().strftime("%H:%M"), "updated": updated.strftime("%H:%M") if updated else "",
         "orchestrator": _procs["orchestrator"], "supervisor": _procs["supervisor"], "flags": flags,
@@ -951,6 +1456,8 @@ def build_state() -> dict:
         "agents": agent_list, "accounts": accounts, "milestones": order, "events": events, "supervisor_msg": last_sup[:200],
         "complete": bool(board.get("project_complete")),
         "configured": bool(agents), "demo": False, "manage": MANAGE,
+        "approvals": pending_approvals,
+        "approval_wait": [r.get("task", "") for r in pending_approvals if r.get("task")],
         "counts": {s: sum(1 for t in board.get("tasks", []) if t["status"] == s)
                    for s in ("done", "in_progress", "ready", "backlog", "blocked")},
     }
@@ -1210,6 +1717,31 @@ class Handler(BaseHTTPRequestHandler):
             if MANAGE and not host_allowed(self.headers.get("Host", "")):
                 return self.deny(403, "bad host")
             return self.send(200, json.dumps(build_info()).encode("utf-8"), "application/json")
+        if path == "/api/approvals":
+            if DEMO:
+                from demo import demo_approvals
+                return self.send(200, json.dumps(demo_approvals()).encode("utf-8"),
+                                  "application/json")
+            if MANAGE and not host_allowed(self.headers.get("Host", "")):
+                return self.deny(403, "bad host")
+            return self.send(200, json.dumps({"pending": list_approvals()}).encode("utf-8"),
+                              "application/json")
+        if path == "/api/config":
+            if DEMO:
+                from demo import demo_config
+                return self.send(200, json.dumps(demo_config()).encode("utf-8"),
+                                  "application/json")
+            if not self.check_manage():
+                return
+            cfg = read_config()
+            if cfg is None:
+                return self.deny(500, "cannot read config")
+            agents = cfg.get("agents") or {}
+            return self.send(200, json.dumps({
+                "config": cfg, "mtime": config_mtime(), "models": models_list(),
+                "paid": {n: agent_paid(cfg, n) for n in agents},
+                "kinds": {n: agent_kind(cfg, n) for n in agents},
+            }).encode("utf-8"), "application/json")
         if path in ("/api/requests", "/api/probe"):
             if DEMO:
                 if path == "/api/requests":
@@ -1264,7 +1796,64 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_notify_post()
         if path == "/api/command":
             return self.handle_command_post(data)
+        if path == "/api/config":
+            return self.handle_config_post(data)
+        if path == "/api/approval":
+            return self.handle_approval_post(data)
         return self.deny(404, "unknown endpoint")
+
+    def handle_config_post(self, data: dict) -> None:
+        base = data.get("base_mtime")
+        changes = data.get("changes")
+        if not isinstance(base, (int, float)) or not isinstance(changes, dict):
+            return self.deny(400, "base_mtime and changes required")
+        with _write_lock:
+            try:
+                raw_before = config_path().read_text(encoding="utf-8")
+            except OSError:
+                return self.deny(500, "cannot read config")
+            try:
+                cur_mtime = config_path().stat().st_mtime
+            except OSError:
+                return self.deny(500, "cannot read config")
+            if abs(cur_mtime - float(base)) > 0.01:
+                return self.deny(409, "config changed since base_mtime")
+            try:
+                cfg = json.loads(raw_before)
+            except ValueError:
+                return self.deny(500, "cannot read config")
+            try:
+                new_cfg, summary, restart_needed = apply_config_changes(cfg, changes)
+            except ConfigError as e:
+                return self.deny(e.code, e.msg)
+            mtime = write_config_file(new_cfg, raw_before)
+        office_event(f"OFFICE config changed: {summary}"[:220])
+        invalidate()
+        self.send(200, json.dumps({"ok": True, "restart_needed": restart_needed,
+                                   "mtime": mtime}).encode("utf-8"), "application/json")
+
+    def handle_approval_post(self, data: dict) -> None:
+        task = data.get("task", "")
+        decision = data.get("decision", "")
+        feedback = data.get("feedback", "")
+        if not isinstance(task, str) or not TASK_ID_RE.match(task):
+            return self.deny(400, "bad task")
+        if decision not in ("approve", "revise"):
+            return self.deny(400, "bad decision")
+        if decision == "revise" and not (isinstance(feedback, str) and feedback.strip()):
+            return self.deny(400, "feedback required for revise")
+        req_path = approvals_dir() / f"{task}.json"
+        if not req_path.is_file():
+            return self.deny(409, "no request pending")
+        dec_path = approvals_dir() / f"{task}.decision.json"
+        payload = {"decision": decision, "feedback": feedback if isinstance(feedback, str) else "",
+                   "at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        with _write_lock:
+            if not req_path.is_file():
+                return self.deny(409, "no request pending")
+            atomic_write(dec_path, json.dumps(payload, indent=2))
+        invalidate()
+        self.send(200, json.dumps({"ok": True}).encode("utf-8"), "application/json")
 
     def handle_command_post(self, data: dict) -> None:
         board = read_json(ROOT / "project" / "board.json") or {}

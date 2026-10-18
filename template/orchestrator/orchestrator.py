@@ -122,7 +122,7 @@ def ms_index(ms: str) -> int:
 def all_milestones(board: dict) -> list[str]:
     return sorted({t["milestone"] for t in board["tasks"]} | set(MILESTONES), key=ms_index)
 TASK_FIELDS = ["title", "description", "acceptance", "priority", "depends_on", "owner", "type", "scenario", "milestone",
-               "skip_qa"]
+               "skip_qa", "needs_approval"]
 ROLE_FOR_TYPE = {"code": "project/roles/coder.md", "asset": "project/roles/qa_assets.md",
                  "qa": "project/roles/qa_assets.md", "design": "project/roles/quarterback.md"}
 # Agent labels, models and accounts come from config.json ("label", "model", "account" per agent).
@@ -155,6 +155,15 @@ def resolve_worker(task: dict, lane: str, attempt: int) -> str:
     if owner not in CODER_OWNERS:
         return owner
     pool = coders()
+    benched = set(CONFIG.get("disabled_agents") or [])
+    avail = [c for c in pool if c not in benched]
+    if not avail:
+        try:
+            event(f"WARNING every coder is benched; ignoring the bench for this task")
+        except Exception:  # noqa: BLE001
+            pass
+        avail = list(pool)
+    pool = avail
     first = owner if owner in pool else pool[lane_index(lane) % len(pool)]
     i = pool.index(first)
     return pool[(i + attempt - 1) % len(pool)]
@@ -708,7 +717,7 @@ def preemptive_handoff() -> None:
     """Hand OpenAI work to the fallbacks *before* the limit hits, using Codex's own usage numbers."""
     th = CONFIG.get("handoff_at_percent") or {}
     rl = codex_usage()
-    if not rl or limited_until(QA):
+    if not rl or unavailable(QA):
         return
     for key in ("primary", "secondary"):
         w = rl.get(key) or {}
@@ -736,6 +745,340 @@ def limited_until(agent: str) -> dt.datetime | None:
     return until if until and until > dt.datetime.now() else None
 
 
+def benched(agent: str) -> bool:
+    """True when the owner benched this position from the Office (live, no restart)."""
+    try:
+        return agent in (CONFIG.get("disabled_agents") or [])
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def unavailable(agent: str) -> bool:
+    """A benched agent is skipped like a limited one, so the existing fallback chain takes over."""
+    return benched(agent) or bool(limited_until(agent))
+
+
+def persist_disabled_agents() -> None:
+    """Persist CONFIG["disabled_agents"] to config.json with the Office's atomic-write + backup rules."""
+    cfg_path = Path(__file__).parent / "config.json"
+    try:
+        raw = cfg_path.read_text(encoding="utf-8")
+        cfg = json.loads(raw)
+    except (OSError, ValueError):
+        return
+    cfg["disabled_agents"] = list(CONFIG.get("disabled_agents") or [])
+    text = json.dumps(cfg, indent=2)
+    try:
+        backup_dir = Path(__file__).parent / "config.backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        (backup_dir / f"config-{stamp}.json").write_text(raw, encoding="utf-8")
+        existing = sorted(backup_dir.glob("config-*.json"), key=lambda p: p.name)
+        for old in existing[:-20]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        tmp = cfg_path.with_name(cfg_path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, cfg_path)
+    except OSError:
+        pass
+
+
+# ----------------------------------------------------------------------------- opencode spend parser
+# NOTE: this copy is kept identical to template/office/stats.py:parse_opencode_stats
+# (the orchestrator must stay a single file). Both copies parse `opencode stats --models` output.
+
+_SPEND_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_SPEND_BOX_RE = re.compile(r"[│┃║─━┌┐└┘├┤┬┴┼╭╮╯╰]")
+
+
+def _spend_num_tokens(s: str) -> int | None:
+    s = (s or "").strip().replace(",", "")
+    m = re.match(r"^([\d.]+)\s*([KkMm])?$", s)
+    if not m:
+        return None
+    try:
+        v = float(m.group(1))
+    except ValueError:
+        return None
+    suf = (m.group(2) or "").upper()
+    if suf == "K":
+        v *= 1000
+    elif suf == "M":
+        v *= 1000000
+    return int(round(v))
+
+
+def _spend_money(s: str) -> float | None:
+    m = re.search(r"\$\s*([\d,]+\.\d+|[\d,]+)", s or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def parse_opencode_stats(text) -> dict:
+    """Parse `opencode stats --models` box-drawing output.
+
+    Returns {"total": float|None, "models": {name: {messages, input_tokens,
+    output_tokens, cost}}}. Garbage input gives {"total": None, "models": {}}.
+    """
+    try:
+        if not isinstance(text, str) or not text:
+            return {"total": None, "models": {}}
+        clean = _SPEND_ANSI_RE.sub("", text)
+        clean = _SPEND_BOX_RE.sub(" ", clean)
+        lines = [ln.strip() for ln in clean.splitlines()]
+        lines = [ln for ln in lines if ln]
+        total = None
+        for ln in lines:
+            if "total cost" in ln.lower():
+                total = _spend_money(ln)
+                break
+        models: dict = {}
+        cur: str | None = None
+        buf: dict = {}
+        keywords = ("messages", "input tokens", "output tokens", "cost")
+
+        def flush():
+            if cur and buf:
+                models[cur] = dict(buf)
+
+        for ln in lines:
+            low = ln.lower()
+            if "total cost" in low:
+                continue
+            if any(k in low for k in keywords):
+                if cur is None:
+                    continue
+                if "messages" in low:
+                    m = re.search(r"(\d[\d,]*)\s*$", ln)
+                    if m:
+                        try:
+                            buf["messages"] = int(m.group(1).replace(",", ""))
+                        except ValueError:
+                            pass
+                elif "input tokens" in low:
+                    m = re.search(r"([\d.,]+\s*[KkMm]?)\s*$", ln)
+                    if m:
+                        v = _spend_num_tokens(m.group(1))
+                        if v is not None:
+                            buf["input_tokens"] = v
+                elif "output tokens" in low:
+                    m = re.search(r"([\d.,]+\s*[KkMm]?)\s*$", ln)
+                    if m:
+                        v = _spend_num_tokens(m.group(1))
+                        if v is not None:
+                            buf["output_tokens"] = v
+                elif "cost" in low:
+                    v = _spend_money(ln)
+                    if v is not None:
+                        buf["cost"] = v
+                continue
+            stripped = ln.strip()
+            if "/" in stripped and " " not in stripped and len(stripped) < 120:
+                if re.match(r"^[\w.\-/:@+]+$", stripped):
+                    flush()
+                    cur = stripped
+                    buf = {}
+                    continue
+        flush()
+        models = {k: v for k, v in models.items() if v}
+        return {"total": total, "models": models}
+    except Exception:
+        return {"total": None, "models": {}}
+
+
+def opencode_stats_today():
+    """Today's OpenCode spend (`opencode stats --days 1 --models`, no --project: money is
+    spent across all projects). Cached for 5 min. Returns the parsed dict or None."""
+    now_t = time.time()
+    cached = _state.get("spend_cap_cache")
+    if cached and now_t - cached.get("t", 0) < 5 * 60:
+        return cached.get("data")
+    exe = shutil.which("opencode")
+    data = None
+    if exe:
+        try:
+            r = subprocess.run([exe, "stats", "--days", "1", "--models"], cwd=ROOT,
+                               capture_output=True, text=True, timeout=60, encoding="utf-8",
+                               errors="replace")
+            if r.returncode == 0:
+                data = parse_opencode_stats(r.stdout)
+            else:
+                data = None
+        except Exception:  # noqa: BLE001
+            data = None
+    _state["spend_cap_cache"] = {"t": now_t, "data": data}
+    return data
+
+
+def agent_model(agent: str) -> str:
+    """The agent's model id: its "model" field, else the value after -m/--model in its cmd."""
+    a = (CONFIG.get("agents") or {}).get(agent) or {}
+    if a.get("model"):
+        return a["model"]
+    cmd = a.get("cmd") or []
+    for i, part in enumerate(cmd[:-1]):
+        if part in ("-m", "--model"):
+            return cmd[i + 1]
+    return ""
+
+
+def spend_capped_agents() -> list[str]:
+    cfg = CONFIG.get("spend_cap") or {}
+    agents = cfg.get("agents") or CONFIG.get("paid_agents") or []
+    return [a for a in agents if a in CONFIG.get("agents", {})]
+
+
+def check_spend_cap(agent: str) -> None:
+    """Park pay-per-use accounts until local midnight when today's spend hits the cap."""
+    cfg = CONFIG.get("spend_cap") or {}
+    try:
+        cap = float(cfg.get("daily_usd") or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    if cap <= 0:
+        return
+    capped = spend_capped_agents()
+    if agent not in capped:
+        return
+    data = opencode_stats_today()
+    if not data or data.get("total") is None and not data.get("models"):
+        last = _state.get("spend_cap_fail_logged", 0)
+        if time.time() - last > 3600:
+            _state["spend_cap_fail_logged"] = time.time()
+            event(f"SPEND CAP check failed: could not read opencode stats")
+        return
+    agents_cfg = CONFIG.get("agents") or {}
+    models = {agent_model(a) for a in capped} - {""}
+    parsed_models = data.get("models") or {}
+    total = 0.0
+    for mname, mdata in parsed_models.items():
+        if mname in models:
+            try:
+                total += float((mdata or {}).get("cost") or 0)
+            except (TypeError, ValueError):
+                pass
+    if total < cap:
+        return
+    midnight = (dt.datetime.now() + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    for a in capped:
+        acct = ACCOUNT.get(a, a)
+        cur = _state.setdefault("limited_until", {}).get(acct)
+        if not (cur and cur > dt.datetime.now()):
+            _state.setdefault("limited_until", {})[acct] = midnight
+        _state.setdefault("spend_parked", {})[acct] = midnight
+    today = dt.date.today().isoformat()
+    if _state.get("spend_cap_day") != today:
+        _state["spend_cap_day"] = today
+        event(f"SPEND CAP {agent} ${total:.2f} >= ${cap:.2f} today - parked until 00:00")
+        notify(f"spend-cap-{today}", "{{GAME_NAME}}: spend cap reached",
+               f"Today's OpenCode spend is ${total:.2f} (cap ${cap:.2f}). "
+               f"Pay-per-use agents are parked until midnight.", email=True)
+
+
+def approval_gate_cfg() -> dict:
+    cfg = CONFIG.get("approval_gate") or {}
+    return {"enabled": bool(cfg.get("enabled", False)),
+            "types": list(cfg.get("types") or []),
+            "workers": list(cfg.get("workers") or []),
+            "timeout_minutes": float(cfg.get("timeout_minutes") or 0)}
+
+
+def task_needs_approval(task: dict, worker: str) -> bool:
+    """A task needs approval when the gate is enabled AND (type/worker/flag match), or when
+    its per-task needs_approval flag is set explicitly (works even with the gate off)."""
+    if task.get("needs_approval") is True:
+        return True
+    gate = approval_gate_cfg()
+    if not gate["enabled"]:
+        return False
+    if task.get("type") in gate["types"]:
+        return True
+    if worker in gate["workers"]:
+        return True
+    return False
+
+
+def await_approval(task: dict, n: int, lane: str, worker: str = "", summary: str = "",
+                   review_summary: str = "", qa_verdict: str = "", checks_summary: str = "",
+                   patch: str = "", screenshot: str = "",
+                   sleep=time.sleep, clock=time.time) -> tuple[str, str]:
+    """Wait for the owner's approval decision. Returns (decision, feedback).
+
+    The request file project/approvals/<task>.json must already exist (written by run_task).
+    Polls every 10 s for project/approvals/<task>.decision.json. check_stop() runs on every
+    poll so STOP still works. Afterwards both files move to project/approvals/done/.
+    """
+    tid = task.get("id", "")
+    gate = approval_gate_cfg()
+    try:
+        timeout_s = float(gate.get("timeout_minutes") or 0) * 60
+    except (TypeError, ValueError):
+        timeout_s = 0
+    req_path = PROJECT / "approvals" / f"{tid}.json"
+    dec_path = PROJECT / "approvals" / f"{tid}.decision.json"
+    done_dir = PROJECT / "approvals" / "done"
+    try:
+        t0 = clock()
+    except Exception:  # noqa: BLE001
+        t0 = time.time()
+    while True:
+        check_stop()
+        raw = None
+        try:
+            if dec_path.is_file():
+                raw = dec_path.read_text(encoding="utf-8")
+        except OSError:
+            raw = None
+        if raw:
+            try:
+                dec = json.loads(raw)
+            except ValueError:
+                dec = None
+            if isinstance(dec, dict) and dec.get("decision") in ("approve", "revise"):
+                decision = dec["decision"]
+                feedback = str(dec.get("feedback") or "")
+                try:
+                    done_dir.mkdir(parents=True, exist_ok=True)
+                    for src in (req_path, dec_path):
+                        try:
+                            if src.is_file():
+                                (done_dir / src.name).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+                                src.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                except Exception:  # noqa: BLE001
+                    pass
+                event(f"APPROVAL {tid} {decision}")
+                return decision, feedback
+        if timeout_s > 0:
+            try:
+                elapsed = clock() - t0
+            except Exception:  # noqa: BLE001
+                elapsed = 0
+            if elapsed >= timeout_s:
+                try:
+                    done_dir.mkdir(parents=True, exist_ok=True)
+                    for src in (req_path, dec_path):
+                        try:
+                            if src.is_file():
+                                (done_dir / src.name).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+                                src.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                except Exception:  # noqa: BLE001
+                    pass
+                event(f"APPROVAL TIMEOUT {tid} - auto-approved")
+                return "approve", ""
+        sleep(10)
+
+
 def fallback_for(agent: str, step_kind: str, avoid: str | None = None) -> list[str]:
     """Fallback agents for a step, in order of preference (free/subscriptions first, paid API last).
     `avoid` (e.g. the model that wrote the code being QA'd) moves behind the other free agents but stays ahead of
@@ -753,6 +1096,11 @@ def fallback_for(agent: str, step_kind: str, avoid: str | None = None) -> list[s
 def probe_agent(agent: str) -> None:
     """Send a tiny prompt to a rate-limited agent. If it answers, the limit was lifted early
     (e.g. the owner used a Codex limit reset), so clear it and resume at once."""
+    if benched(agent):
+        return  # a benched agent is never probed
+    parked = _state.get("spend_parked", {}).get(ACCOUNT.get(agent, agent))
+    if parked and parked > dt.datetime.now():
+        return  # parked by the spend cap: answering a probe must not resume paid work before midnight
     cmd = [("Reply with exactly: OK" if part == "{prompt}" else part)
            for part in CONFIG["agents"][agent]["cmd"] if part != "{images}"]
     rc, out, timed_out = run_proc(cmd, 300, watch_rate_limit=CONFIG["agents"][agent].get("watch_rate_limit", False))
@@ -783,14 +1131,26 @@ def call_agent(agent: str, prompt_file: Path, out_file: Path, log_name: str, boa
             preemptive_handoff()
         except Exception:  # noqa: BLE001 - usage peeking must never break a task
             pass
+        try:
+            check_spend_cap(agent)
+            for _fb in fallback_for(agent, step_kind, avoid):
+                check_spend_cap(_fb)
+        except Exception:  # noqa: BLE001 - spend checks must never break a task
+            pass
         use = agent
-        if limited_until(agent):
+        if unavailable(agent):
             chain = fallback_for(agent, step_kind, avoid)
-            free = [f for f in chain if not limited_until(f)]
+            free = [f for f in chain if not unavailable(f)]
             if free:
                 use = free[0]
             else:
-                until = min(u for u in [limited_until(a) for a in [agent] + chain] if u)
+                uls = [limited_until(a) for a in [agent] + chain]
+                uls = [u for u in uls if u]
+                if not uls:
+                    sleep_minutes(CONFIG.get("probe_every_minutes", 15), board,
+                                  f"waiting for a benched agent to return ({log_name})")
+                    continue
+                until = min(uls)
                 if CONFIG.get("stop_on_usage_limit"):
                     raise UsageLimitStop(agent)
                 remaining = (until - dt.datetime.now()).total_seconds() / 60 + 1
@@ -807,7 +1167,10 @@ def call_agent(agent: str, prompt_file: Path, out_file: Path, log_name: str, boa
                 continue
         if use != agent and _state.get("last_fallback") != (agent, use):
             lu = limited_until(agent)
-            when = f"{lu:%H:%M}" if lu.date() == dt.date.today() else f"{lu:%a %b %d %H:%M}"
+            if lu:
+                when = f"{lu:%H:%M}" if lu.date() == dt.date.today() else f"{lu:%a %b %d %H:%M}"
+            else:
+                when = "benched"
             event(f"FALLBACK {agent} is limited until {when}; {use} handles {step_kind} steps")
         _state["last_fallback"] = (agent, use) if use != agent else None
         if out_file.exists():
@@ -1407,6 +1770,56 @@ def run_task(board: dict, task: dict, lane: str = "A") -> str:
             add_task(board, spec, f"review {tid}")
 
         if verdict == "approve" and checks["passed"]:
+            if task_needs_approval(task, agent):
+                appr_dir = PROJECT / "approvals"
+                try:
+                    appr_dir.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pass
+                patch_path = d / "approval.patch"
+                try:
+                    save_patch(checkpoint, patch_path)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    patch_rel = patch_path.relative_to(ROOT).as_posix()
+                except ValueError:
+                    patch_rel = patch_path.as_posix()
+                shot = ""
+                try:
+                    imgs = list(d.glob("*.png"))
+                    if imgs:
+                        shot = imgs[0].relative_to(ROOT).as_posix()
+                except (OSError, ValueError):
+                    shot = ""
+                req = {"task": tid, "title": task.get("title", ""), "attempt": n, "lane": lane,
+                       "worker": agent, "requested_at": now(),
+                       "summary": str(work.get("summary", ""))[:2000],
+                       "review_summary": str(review.get("summary", ""))[:2000],
+                       "qa_verdict": str((qa or {}).get("verdict", "")),
+                       "checks_summary": str(checks.get("tests_summary", ""))[:1000],
+                       "patch": patch_rel, "screenshot": shot}
+                (appr_dir / f"{tid}.decision.json").unlink(missing_ok=True)  # stale, from an interrupted wait
+                try:
+                    (appr_dir / f"{tid}.json").write_text(json.dumps(req, indent=2), encoding="utf-8")
+                except OSError:
+                    pass
+                event(f"APPROVAL WAIT {tid} (lane {lane})")
+                notify(f"approval-{tid}", "{{GAME_NAME}}: approval needed for " + tid,
+                       f"{tid}: {task.get('title', '')} (attempt {n}, lane {lane}, worker {agent}) "
+                       f"is waiting for owner approval.", email=True)
+                set_now(f"waiting for owner approval of {tid}", board)
+                decision, dec_feedback = await_approval(
+                    task, n, lane, worker=agent, summary=req["summary"],
+                    review_summary=req["review_summary"], qa_verdict=req["qa_verdict"],
+                    checks_summary=req["checks_summary"], patch=patch_rel, screenshot=shot)
+                if decision == "revise":
+                    verdict = "revise"
+                    hist["review"] = "revise"
+                    feedback = f"Owner requested changes: {dec_feedback}"
+                    final_reason = feedback
+                    save_board(board)
+                    continue
             title = f"{tid}: {task['title']}"
             body = f"{work.get('summary', '')}\n\nReview: {review.get('summary', '')}"
             if lane != "A":
@@ -1473,6 +1886,12 @@ def recover(board: dict, lanes: tuple | None = None) -> None:
         pass
     lanes = lanes or ("A", *WORKTREE_LANES)
     interrupted = [t for t in board["tasks"] if t["status"] == "in_progress" and t.get("lane", "A") in lanes]
+    for t in interrupted:  # an approval wait died with its task: drop the request so the Office stops offering it
+        for f in (PROJECT / "approvals" / f"{t['id']}.json", PROJECT / "approvals" / f"{t['id']}.decision.json"):
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
     by_root: dict[Path, list[dict]] = {ROOT: []}
     for t in interrupted:
         ln = t.get("lane", "A")
@@ -1747,7 +2166,7 @@ def can_start_now(task: dict) -> bool:
     """False when the task's owner is rate-limited and no fallback can cover its work step."""
     owners = coders() if task["owner"] in CODER_OWNERS else [resolve_owner(task["owner"])]
     for owner in owners:
-        if not limited_until(owner) or any(not limited_until(f) for f in fallback_for(owner, f"work-{task['type']}")):
+        if not unavailable(owner) or any(not unavailable(f) for f in fallback_for(owner, f"work-{task['type']}")):
             return True
     return False
 
@@ -1843,11 +2262,18 @@ def _process_command_file(board: dict, path: Path, done_dir: Path) -> None:
                         str(action) if isinstance(action, str) and action else "?",
                         "new", "refused: malformed")
         return
-    if action not in ("set_priority", "set_status", "retry", "add_task"):
+    if action not in ("set_priority", "set_status", "retry", "add_task",
+                      "bench", "unbench", "set_approval"):
         _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
         return
     # Missing required keys -> malformed; bad values -> refused.
     if action in ("set_priority", "set_status", "retry") and "task" not in data:
+        _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
+        return
+    if action in ("bench", "unbench") and "agent" not in data:
+        _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
+        return
+    if action == "set_approval" and ("task" not in data or "required" not in data):
         _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
         return
     if action == "set_priority" and "priority" not in data:
@@ -1938,6 +2364,71 @@ def _process_command_file(board: dict, path: Path, done_dir: Path) -> None:
             return
         try:
             git_commit(f"OWNER: retry {tid}", paths=["project"])
+        except Exception:  # noqa: BLE001
+            pass
+        _finish_command(path, done_dir, data, raw, cid, action, tid, "applied")
+        return
+
+    if action == "bench":
+        agent_name = data.get("agent")
+        if not isinstance(agent_name, str):
+            _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
+            return
+        if agent_name not in CONFIG.get("agents", {}):
+            _finish_command(path, done_dir, data, raw, cid, action, agent_name, "refused: unknown agent")
+            return
+        reason = data.get("reason") if isinstance(data.get("reason"), str) else ""
+        disabled = set(CONFIG.get("disabled_agents") or [])
+        if agent_name in disabled:
+            _finish_command(path, done_dir, data, raw, cid, action, agent_name, "applied")
+            return
+        if agent_name in coders():
+            others = [c for c in coders() if c != agent_name and c not in disabled]
+            if not others:
+                _finish_command(path, done_dir, data, raw, cid, action, agent_name,
+                                "refused: cannot bench the last available coder")
+                return
+        disabled.add(agent_name)
+        CONFIG["disabled_agents"] = sorted(disabled)
+        persist_disabled_agents()
+        event(f"BENCH {agent_name}" + (f" ({reason})" if reason.strip() else ""))
+        _finish_command(path, done_dir, data, raw, cid, action, agent_name, "applied")
+        return
+
+    if action == "unbench":
+        agent_name = data.get("agent")
+        if not isinstance(agent_name, str):
+            _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
+            return
+        if agent_name not in CONFIG.get("agents", {}):
+            _finish_command(path, done_dir, data, raw, cid, action, agent_name, "refused: unknown agent")
+            return
+        disabled = set(CONFIG.get("disabled_agents") or [])
+        disabled.discard(agent_name)
+        CONFIG["disabled_agents"] = sorted(disabled)
+        persist_disabled_agents()
+        event(f"UNBENCH {agent_name}")
+        _finish_command(path, done_dir, data, raw, cid, action, agent_name, "applied")
+        return
+
+    if action == "set_approval":
+        tid = data.get("task")
+        req = data.get("required")
+        if not isinstance(tid, str):
+            _finish_command(path, done_dir, data, raw, cid, action, "new", "refused: malformed")
+            return
+        if not isinstance(req, bool):
+            _finish_command(path, done_dir, data, raw, cid, action, tid, "refused: bad required")
+            return
+        t = task_by_id(board, tid)
+        if not t:
+            _finish_command(path, done_dir, data, raw, cid, action, tid, "refused: unknown task")
+            return
+        with BOARD_LOCK:
+            t["needs_approval"] = req
+        save_board(board)
+        try:
+            git_commit(f"OWNER: set {tid} needs_approval to {req}", paths=["project"])
         except Exception:  # noqa: BLE001
             pass
         _finish_command(path, done_dir, data, raw, cid, action, tid, "applied")

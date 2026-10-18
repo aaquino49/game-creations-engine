@@ -93,6 +93,8 @@ Lessons that aren't code:
 | Change models | edit the position's `model` (and matching `-m` in its `cmd`) in `orchestrator/config.json`, commit, `project/RESTART`; reorder `coders` / `fallback` for priority |
 | Never | edit `project/board.json` while the orchestrator runs |
 
+**Approval gate: when to ask for it.** Leave the gate off for ordinary coding (review + checks already approve most tasks on attempt 1). Turn it on — or tick "Require my approval" on a single task — for milestone-closing tasks, paid-agent work, and anything that ships to players (exports, store pages, public builds): the lane saves its diff to `runs/T/aN/approval.patch`, waits with ✋ on its plate, and you Approve or Request changes from the Office badge. Set a `timeout_minutes` so an unattended night still ships (waits auto-approve with an `APPROVAL TIMEOUT` event), and use the per-task flag for one-off gates while the global gate stays off.
+
 ## 6. Tuning knobs (config.json)
 
 | Key | Meaning | Grim Haven value |

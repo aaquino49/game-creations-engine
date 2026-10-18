@@ -305,6 +305,7 @@ function spotFor(job) {
   return { x: d.cx, y: d.by, mode: "sit", key: "desk" + i, desk: i };
 }
 
+let SPEND_SET = new Set(); // agents parked by SPEND CAP (from events text) — 💸 instead of 💤
 function applyState(st) {
   const firstLayout = !L;
   STATE = st;
@@ -319,6 +320,13 @@ function applyState(st) {
   deskInfo = st.lanes;
   const open = st.orchestrator !== false;
   const want = new Map(); // character id -> plan
+  try {
+    SPEND_SET = new Set();
+    for (const ev of (st.events || [])) {
+      const m = /SPEND CAP ([\w-]+)/.exec(ev.text || "");
+      if (m) SPEND_SET.add(m[1]);
+    }
+  } catch (e) {}
   st.agents.forEach((a, idx) => {
     if (!open) return;
     const jobs = st.jobs.filter(j => j.agent === a.id);
@@ -329,6 +337,7 @@ function applyState(st) {
                   title: `${shortName(a.id)}: ${j.task ? j.task + " " : ""}${j.title || ""}` } });
     });
     if (jobs.length) return;
+    if (a.benched) { want.set(a.id, { agent: a.id, idx, benched: true }); return; }
     if (a.limit && a.limit.state === "gone") return; // on leave
     if (a.limit) { want.set(a.id, { agent: a.id, idx, nap: a.limit }); return; }
     want.set(a.id, { agent: a.id, idx, idle: true });
@@ -356,10 +365,17 @@ function applyState(st) {
     if (plan.job) {
       ch.bubble = plan.bubble; ch.say = null; ch.typing = true; ch.napKey = ch.idleKey = null;
       place(ch, plan.spot, plan.spot.mode, plan.spot.key);
+    } else if (plan.benched) {
+      ch.say = null; ch.typing = false;
+      ch.bubble = { text: "🪑 benched", cls: "nap", title: `${shortName(plan.agent)} is benched (sitting out)` };
+      ch.idleKey = ch.napKey = null;
+      place(ch, { x: 214 + (plan.idx % 3) * 16, y: 78 + (plan.idx % 2) * 6 }, "couch", "bench:" + plan.agent);
     } else if (plan.nap) {
       ch.say = null;
-      ch.bubble = { text: plan.nap.state === "limited" ? `💤 back ~${plan.nap.until}` : `🔌 down ~${plan.nap.until}`, cls: "nap",
-                    title: `${shortName(plan.agent)} is ${plan.nap.state === "limited" ? "rate-limited" : "unavailable (provider down)"} until about ${plan.nap.until}` };
+      const isSpend = SPEND_SET.has(plan.agent);
+      const emo = plan.nap.state === "limited" ? (isSpend ? "💸" : "💤") : "🔌";
+      ch.bubble = { text: plan.nap.state === "limited" ? `${emo} back ~${plan.nap.until}` : `🔌 down ~${plan.nap.until}`, cls: "nap",
+                    title: `${shortName(plan.agent)} is ${plan.nap.state === "limited" ? (isSpend ? "parked by spend cap" : "rate-limited") : "unavailable (provider down)"} until about ${plan.nap.until}` };
       ch.idleKey = null;
       if (!ch.napKey) {
         const seat = NAP_SEATS.map((s, i) => ["seat" + i, s]).find(([k]) => !napTaken.has(k))
@@ -562,7 +578,9 @@ function drawOverlay(t) {
   // desk name plates and desk-only states (tests running, waiting to merge, alerts)
   deskInfo.forEach((info, i) => {
     const d = L.desks[i];
-    ov("plate" + i, "plate" + (i === pinnedDesk ? " pinned" : ""), "Lane " + info.lane, d.plate[0], d.plate[1]);
+    let plateTxt = "Lane " + info.lane;
+    try { if (STATE && STATE.approval_wait && info.task && STATE.approval_wait.includes(info.task)) plateTxt += " ✋"; } catch (e) {}
+    ov("plate" + i, "plate" + (i === pinnedDesk ? " pinned" : ""), plateTxt, d.plate[0], d.plate[1]);
     bindPlate(ovEls.get("plate" + i), i, "Lane " + info.lane + (info.state === "busy" ? ": " + info.task + " " + (info.title || "") : ": idle"));
     const someoneHere = [...chars.values()].some(c => c.targetKey === "desk" + i && !c.leaving);
     const fx = deskFx[i] || {};
@@ -585,7 +603,12 @@ function drawOverlay(t) {
     bindTag(ovEls.get("tag" + ch.id), ch.id, (ch.label || ch.id) + (ch.bubble ? ": " + (ch.bubble.title || ch.bubble.text) : ""));
     if (ch.say && ch.say.until > t) ov("say" + ch.id, "bubble chat", ch.say.text, ch.x, top - 3);
     else if (ch.bubble && !ch.path.length && (ch.id === hoverCh || ch.id === pinnedCh)) ov("b" + ch.id, "bubble " + ch.bubble.cls, ch.bubble.text, ch.x, top - 3 + stagger, ch.bubble.title);
-    if (ch.mode === "couch" || ch.mode === "floor") ov("z" + ch.id, "emoji", Math.floor(t * 1.5) % 2 ? "💤" : "💭", ch.x + 9, top + 2);
+    if (ch.mode === "couch" || ch.mode === "floor") {
+      let _z = Math.floor(t * 1.5) % 2 ? "💤" : "💭";
+      try { if ((SPEND_SET && SPEND_SET.has(ch.agent)) || (ch.bubble && /💸|spend cap|SPEND/.test(ch.bubble.title || ""))) _z = "💸"; } catch (e) {}
+      if (ch.targetKey && ch.targetKey.startsWith("bench:")) _z = "🪑";
+      ov("z" + ch.id, "emoji", _z, ch.x + 9, top + 2);
+    }
   }
   for (const p of Object.values(pets)) {
     if (p.say && p.say.until > t) ov("say" + p.id, "bubble woof", p.say.text, p.x, p.y - R[p.kind][3] - 3);
@@ -694,6 +717,13 @@ function renderSide(st) {
     const name = document.createElement("div"); name.className = "name"; name.textContent = shortName(a.id);
     if (a.coder) { const b = document.createElement("span"); b.className = "badge"; b.textContent = "coder"; name.appendChild(b); }
     if (a.paid) { const b = document.createElement("span"); b.className = "badge paid"; b.textContent = "paid"; name.appendChild(b); }
+    if (a.benched) { const b = document.createElement("span"); b.className = "badge"; b.textContent = "benched"; name.appendChild(b); }
+    if (st.manage) {
+      const bb = document.createElement("button"); bb.type = "button"; bb.className = "benchbtn";
+      bb.textContent = a.benched ? "Unbench" : "Bench";
+      bb.addEventListener("click", (e) => runAction(e.target, "api/command", a.benched ? { action: "unbench", agent: a.id } : { action: "bench", agent: a.id }));
+      name.appendChild(bb);
+    }
     const w = document.createElement("div"); w.className = "what"; w.textContent = what;
     w.title = `${a.label}${a.model ? " · " + a.model : ""}\n${what}`;
     info.append(name, w);
@@ -958,11 +988,11 @@ wireManage();
 // ------------------------------------------------------------------ phase 2: views, drawer, timeline, board/graph, actions
 let VIEW = "office";
 try { VIEW = localStorage.getItem("officeView") || "office"; } catch (e) {}
-if (["office", "board", "graph", "stats", "notes"].includes(DEEP.get("view"))) VIEW = DEEP.get("view");
+if (["office", "board", "graph", "stats", "notes", "settings"].includes(DEEP.get("view"))) VIEW = DEEP.get("view");
 function setView(v) {
   VIEW = v;
   try { localStorage.setItem("officeView", v); } catch (e) {}
-  for (const [id, name] of [["viewOffice", "office"], ["viewBoard", "board"], ["viewGraph", "graph"], ["viewStats", "stats"], ["viewNotes", "notes"]]) {
+  for (const [id, name] of [["viewOffice", "office"], ["viewBoard", "board"], ["viewGraph", "graph"], ["viewStats", "stats"], ["viewNotes", "notes"], ["viewSettings", "settings"]]) {
     const b = document.getElementById(id);
     if (!b) continue;
     b.classList.toggle("on", VIEW === name);
@@ -974,16 +1004,20 @@ function setView(v) {
   document.getElementById("graphView").hidden = VIEW !== "graph";
   document.getElementById("statsView").hidden = VIEW !== "stats";
   document.getElementById("notesView").hidden = VIEW !== "notes";
+  const _sv = document.getElementById("settingsView");
+  if (_sv) _sv.hidden = VIEW !== "settings";
   if (VIEW === "board") refreshBoard();
   if (VIEW === "graph") refreshGraph();
   if (VIEW === "stats") refreshStats();
   if (VIEW === "notes") refreshNotes();
+  if (VIEW === "settings") refreshSettings();
 }
 document.getElementById("viewOffice").addEventListener("click", () => setView("office"));
 document.getElementById("viewBoard").addEventListener("click", () => setView("board"));
 document.getElementById("viewGraph").addEventListener("click", () => setView("graph"));
 document.getElementById("viewStats").addEventListener("click", () => setView("stats"));
 document.getElementById("viewNotes").addEventListener("click", () => setView("notes"));
+try { const _vs = document.getElementById("viewSettings"); if (_vs) _vs.addEventListener("click", () => setView("settings")); } catch (e) {}
 
 let BOARD_CACHE = null, CMD_CACHE = { pending: [], done: [] };
 async function fetchBoard() {
@@ -1399,20 +1433,22 @@ function layoutGraph(b) {
 function drawGraph() {
   const svg = document.getElementById("graphSvg");
   if (!graphData) return;
-  const Wpx = 900, Hpx = 420;
-  svg.setAttribute("viewBox", `0 0 ${Wpx} ${Hpx}`);
+  const layers = graphData.layers; // Q7: layers laid left→right, nodes stacked vertically per layer
+  const maxRows = Math.max(1, ...layers.map(([, arr]) => arr.length));
+  const Wpx = Math.max(400, layers.length * 220 + 120), Hpx = Math.max(200, maxRows * 60 + 80);
+  svg.setAttribute("viewBox", `0 0 ${Wpx} ${Hpx}`); // Q7: fit-to-width on load
+  if (!drawGraph._fit) { drawGraph._fit = true; gz = Math.min(1, (svg.clientWidth || Wpx) / Wpx) || 1; }
   svg.replaceChildren();
   const NS = "http://www.w3.org/2000/svg";
   const g = document.createElementNS(NS, "g");
   g.setAttribute("transform", `translate(${pan.x},${pan.y}) scale(${gz})`);
   svg.appendChild(g);
   const pos = new Map();
-  const layers = graphData.layers;
   const maxRow = Math.max(1, ...layers.map(([, arr]) => arr.length));
-  layers.forEach(([l, arr], li) => {
-    const y = 40 + li * Math.max(60, (Hpx - 80) / Math.max(1, layers.length - 1 || 1));
+  layers.forEach(([l, arr], li) => { // Q7: layer index → x, node index in layer → y
+    const x = 100 + li * 220;
     arr.forEach((t, i) => {
-      const x = 90 + i * Math.max(160, (Wpx - 180) / Math.max(1, arr.length - 1 || 1));
+      const y = 50 + i * 60;
       pos.set(t.id, { x, y });
     });
   });
@@ -1422,7 +1458,7 @@ function drawGraph() {
       if (!pos.has(dep)) continue;
       // skip back-edge that would point backwards in layers (cycle)
       const q = pos.get(dep);
-      if (q.y >= p.y && layers.length > 1) {
+      if (q.x >= p.x && layers.length > 1) {
         // still draw but as a curved back-edge; spec says lay out cycles by ignoring the back-edge:
         // skip edges that go from a deeper-or-equal layer to avoid clutter
         const li = layers.findIndex(([, arr]) => arr.includes(t));
@@ -1430,8 +1466,9 @@ function drawGraph() {
         if (lj >= li) continue;
       }
       const path = document.createElementNS(NS, "path");
-      const mx = (q.x + p.x) / 2;
-      path.setAttribute("d", `M ${q.x} ${q.y} C ${mx} ${q.y}, ${mx} ${p.y}, ${p.x} ${p.y}`);
+      const x1 = q.x + 75, x2 = p.x - 75; // Q7: from node's right edge to next node's left edge
+      const mx = (x1 + x2) / 2;
+      path.setAttribute("d", `M ${x1} ${q.y} C ${mx} ${q.y}, ${mx} ${p.y}, ${x2} ${p.y}`);
       path.setAttribute("fill", "none"); path.setAttribute("stroke", "#94a3b8"); path.setAttribute("stroke-width", "1.5");
       g.appendChild(path);
     }
@@ -1664,19 +1701,24 @@ function paintStats(d) {
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("viewBox", "0 0 520 180"); svg.setAttribute("class", "chart"); svg.setAttribute("role", "img");
     svg.setAttribute("aria-label", "DONE tasks per hour");
-    const wrap = document.createElement("div"); wrap.className = "chartwrap"; wrap.appendChild(svg); box.appendChild(wrap);
+    const wrap = document.createElement("div"); wrap.className = "chartwrap"; wrap.style.maxHeight = "220px"; wrap.style.overflow = "hidden auto"; wrap.appendChild(svg); box.appendChild(wrap);
     const max = Math.max(1, ...tp.buckets.map(b => b.count));
     const n = tp.buckets.length, bw = 460 / Math.max(1, n);
     svgText(svg, 4, 14, "DONE / " + (tp.bucket_hours > 1 ? "6 h" : "hour"), {});
     svgText(svg, 470, 174, "time →", {});
+    for (let gi = 0; gi <= 4; gi++) { // Q1: 0 at baseline (bottom), gridlines with values
+      const val = Math.round(max * gi / 4);
+      const gy = 150 - Math.round(130 * val / max);
+      const gl = svgEl("line", { x1: 40, y1: gy, x2: 500, y2: gy, stroke: "var(--line)", "stroke-width": 1 }, svg);
+      svgText(svg, 4, gy + 3, String(val), {});
+    }
     tp.buckets.forEach((b, i) => {
       const bh = Math.round(130 * b.count / max);
-      const x = 40 + i * bw, y = 150 - bh;
+      const x = 40 + i * bw, y = 150 - bh; // Q1: bars grow up from baseline y=150
       const r = svgEl("rect", { x: x.toFixed(1), y, width: Math.max(1, bw - 2).toFixed(1), height: bh, fill: "var(--accent)" }, svg);
       svgTitle(r, `${b.start}: ${b.count} DONE`);
       if (i % Math.ceil(n / 6) === 0) svgText(svg, x, 164, b.start.slice(5, 13), {});
     });
-    svgText(svg, 4, 150, String(max), {}); svgText(svg, 4, 40, "0", {});
   }
   cap(`DONE events per ${tp.bucket_hours > 1 ? "6 h" : "hour"} over the last ${wl}.`);
   const bd = d.burndown || { milestones: [], series: [] };
@@ -1689,6 +1731,16 @@ function paintStats(d) {
     const max = Math.max(1, ...bd.series.flatMap(p => Object.values(p.open || {})));
     svgText(svg, 4, 14, "open tasks", {});
     svgText(svg, 470, 184, "time →", {});
+    for (let gi = 0; gi <= 4; gi++) { // Q2: y-axis values
+      const val = Math.round(max * gi / 4);
+      const gy = 160 - Math.round(130 * val / max);
+      svgEl("line", { x1: 40, y1: gy, x2: 500, y2: gy, stroke: "var(--line)", "stroke-width": 1 }, svg);
+      svgText(svg, 4, gy + 3, String(val), {});
+    }
+    bd.milestones.forEach((mid, mi) => { // Q2: legend maps colour to milestone
+      svgEl("rect", { x: 60 + mi * 110, y: 2, width: 12, height: 8, fill: cols[mi % cols.length] }, svg);
+      svgText(svg, 74 + mi * 110, 10, mid, {});
+    });
     bd.milestones.forEach((mid, mi) => {
       const pts = bd.series.map((p, i) => `${(40 + i * 460 / Math.max(1, bd.series.length - 1)).toFixed(1)},${(160 - 130 * (p.open[mid] || 0) / max).toFixed(1)}`).join(" ");
       const pl = svgEl("polyline", { points: pts, fill: "none", stroke: cols[mi % cols.length], "stroke-width": 2 }, svg);
@@ -1700,6 +1752,15 @@ function paintStats(d) {
       });
     });
     svgText(svg, 40, 176, (bd.series[0] || {}).t ? bd.series[0].t.slice(5, 13) : "", {});
+    { // Q2: 4-6 time ticks on x-axis
+      const ticks = Math.min(6, Math.max(4, Math.min(bd.series.length, 5)));
+      for (let ti = 0; ti < ticks; ti++) {
+        const si = Math.round(ti * (bd.series.length - 1) / Math.max(1, ticks - 1));
+        const p = bd.series[si]; if (!p) continue;
+        const cx = 40 + si * 460 / Math.max(1, bd.series.length - 1);
+        svgText(svg, cx - 14, 176, (p.t || "").slice(5, 13), {});
+      }
+    }
   }
   cap("Open tasks per milestone over the window (creation → DONE; dropped tasks excluded).");
   const eta = d.eta || {};
@@ -1722,7 +1783,7 @@ function paintStats(d) {
     const t1 = Date.parse((d.now || "").replace(" ", "T")) || (t0 + 3600000);
     const X = (s) => 70 + 420 * (Date.parse(s.replace(" ", "T")) - t0) / Math.max(1, t1 - t0);
     const OUT = { done: "#22c55e", blocked: "#ef4444", running: "#f59e0b", recover: "#38bdf8" };
-    svgText(svg, 4, 14, "lane", {}); svgText(svg, 480, 14 + rows * 26, "time →", {});
+    svgText(svg, 480, 14 + rows * 26, "time →", {}); // Q3: stray "lane" header removed
     g.lanes.forEach((ln, ri) => {
       const y = 24 + ri * 26;
       svgText(svg, 4, y + 10, "lane " + ln.lane, {});
@@ -1749,7 +1810,7 @@ function paintStats(d) {
     });
     const nx = 70 + 420 * 1;
     svgEl("line", { x1: Math.min(490, nx), y1: 20, x2: Math.min(490, nx), y2: 20 + rows * 26, stroke: "var(--bad)", "stroke-width": 1.5 }, svg);
-    svgText(svg, Math.min(470, nx) - 10, 22 + rows * 26, "now", {});
+    svgText(svg, Math.min(470, nx) - 10, 26, "now", {}); // Q3: "now" at top of its line
   }
   cap("Bars run START → DONE / BLOCKED / RECOVER (or now). Hatched rows are account limits. Click a bar for the task.");
   // S4 routing
@@ -1759,7 +1820,8 @@ function paintStats(d) {
     const x = document.createElement("div"); x.className = "muted"; x.textContent = `No completed tasks in the last ${wl}`; box.appendChild(x);
   } else {
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    svg.setAttribute("viewBox", "0 0 520 150"); svg.setAttribute("class", "chart");
+    const _flows = (rt.flows || []).length;
+    svg.setAttribute("viewBox", `0 0 520 ${40 + _flows * 26}`); svg.setAttribute("class", "chart"); // Q4: size SVG to content
     svg.setAttribute("role", "img"); svg.setAttribute("aria-label", "Fallback flow");
     const wrap = document.createElement("div"); wrap.className = "chartwrap"; wrap.appendChild(svg); box.appendChild(wrap);
     svgText(svg, 10, 14, "limited", {}); svgText(svg, 440, 14, "substitute", {});
@@ -1770,8 +1832,9 @@ function paintStats(d) {
       svgText(svg, 10, y + 10, f.from, {});
       svgText(svg, 440, y + 10, f.to, {});
       const w = 40 + 220 * f.count / max;
-      const r = svgEl("rect", { x: 150, y, width: w.toFixed(1), height: 14, fill: statAgentColor(f.from) }, svg);
-      svgTitle(r, `${f.from} → ${f.to}: ${f.count} fallbacks`);
+      const hh = Math.max(4, 14 * f.count / max); // Q4: curved ribbon from left to right
+      const pth = svgEl("path", { d: `M 150 ${y} C 240 ${y}, 260 ${y}, 350 ${y} L 350 ${y + hh} C 260 ${y + hh}, 240 ${y + hh}, 150 ${y + hh} Z`, fill: statAgentColor(f.from), stroke: "#1a1c2c", "stroke-width": 1 }, svg);
+      svgTitle(pth, `${f.from} → ${f.to}: ${f.count} fallbacks`);
     });
   }
   cap("FALLBACK bands: limited agents (left) to substitutes (right), width ∝ count.");
@@ -1820,6 +1883,50 @@ function paintStats(d) {
     const t = document.createElement("div"); t.className = "muted"; t.textContent = `Total: $${p.total ?? "?"}`; box.appendChild(t);
   };
   if (oc) { spend("days1", "OpenCode spend · last day"); spend("days7", "OpenCode spend · last 7 days"); }
+  try { // spend cap meter: today's spend vs cap (amber 80%, red 100%)
+    const scBox = document.createElement("div"); scBox.id = "spendMeter";
+    box.appendChild(scBox);
+    const paintSpend = (capUsd, capAgents) => {
+      scBox.replaceChildren();
+      if (!capUsd) return;
+      let total = 0;
+      try {
+        const mods = ((oc && oc.days1 && oc.days1.models) || {});
+        for (const [m, v] of Object.entries(mods)) {
+          if (!capAgents || !capAgents.length || capAgents.some(a => String(m).includes(a)) || true) {
+            const c = parseFloat(String(v.cost || "0").replace(/[^0-9.]/g, ""));
+            if (!isNaN(c)) total += c;
+          }
+        }
+        if (oc.days1 && oc.days1.total != null && (!oc.days1.models || !Object.keys(oc.days1.models).length)) {
+          const t = parseFloat(String(oc.days1.total).replace(/[^0-9.]/g, "")); if (!isNaN(t)) total = t;
+        }
+      } catch (e) {}
+      const pct = capUsd > 0 ? 100 * total / capUsd : 0;
+      const row = document.createElement("div");
+      const nm = document.createElement("span"); nm.textContent = `Spend today: $${total.toFixed(2)} / $${capUsd} `;
+      const meter = document.createElement("span"); meter.className = "meter" + (pct >= 100 ? " red" : pct >= 80 ? " amber" : "");
+      const fill = document.createElement("span"); fill.style.width = Math.min(100, pct) + "%";
+      meter.appendChild(fill);
+      row.append(nm, meter);
+      row.title = `today's spend vs cap (${pct.toFixed(0)}%)`;
+      scBox.appendChild(row);
+      try {
+        const parked = STATE && STATE.agents && STATE.agents.some(a => a.limit && SPEND_SET.has(a.id));
+        if (parked || pct >= 100) {
+          const n = document.createElement("div"); n.className = "muted"; n.textContent = "parked until 00:00";
+          scBox.appendChild(n);
+        }
+      } catch (e) {}
+    };
+    if (window.__SPEND_CAP) paintSpend(window.__SPEND_CAP.daily_usd, window.__SPEND_CAP.agents);
+    api("api/config", { cache: "no-store" }).then(async r => {
+      if (!r.ok) return;
+      const d = await r.json();
+      const sc = d && d.config && d.config.spend_cap;
+      if (sc && sc.daily_usd) { window.__SPEND_CAP = sc; if (document.getElementById("spendMeter")) paintSpend(sc.daily_usd, sc.agents); }
+    }).catch(() => {});
+  } catch (e) {}
   // S6 incidents
   h("Incident log");
   const inc = d.incidents || { counts: {}, items: [] };
@@ -1893,6 +2000,12 @@ async function refreshBuild() {
   let b = null;
   try { const r = await fetch("api/build", { cache: "no-store" }); if (r.ok) b = await r.json(); } catch (e) {}
   const btn = document.getElementById("btnPlay"), txt = document.getElementById("buildText");
+  try { // Q6: ▶ Play inline at end of control bar; build text at end of pills row in read-only
+    const cb = document.getElementById("controlbar"), pills = document.querySelector(".pills");
+    if (STATE && STATE.manage && b && b.exists && cb) { cb.appendChild(btn); }
+    else if (pills && txt && txt.parentElement !== pills) { pills.appendChild(txt); }
+    else if (pills && btn && !btn.hidden && cb && btn.parentElement !== cb) { cb.appendChild(btn); }
+  } catch (e) {}
   if (!b || !b.exe) { btn.hidden = true; txt.textContent = ""; return; }
   const label = `Build from ${b.mtime || "?"}, ${b.tag || "untagged"}`;
   if (STATE && STATE.manage && b.exists) {
@@ -1915,5 +2028,490 @@ renderSide = function (st) {
   if (VIEW === "graph" && graphData) drawGraph();
   if (VIEW === "stats" && !STATS_CACHE) refreshStats();
 };
-setView(["board", "graph", "stats", "notes"].includes(VIEW) ? VIEW : "office");
+setView(["board", "graph", "stats", "notes", "settings"].includes(VIEW) ? VIEW : "office");
 if (/^T-\d+$/.test(DEEP.get("task") || "")) setTimeout(() => openDrawer(DEEP.get("task")), 600);
+
+// ------------------------------------------------------------------ phase 4: settings, approvals, bench
+let CFG = null, CFG_ORIG = "", CFG_MTIME = 0, CFG_MODELS = [];
+let S_AGENTS = {}, S_CODERS = [], S_FB = {}, S_FB_PAIDLAST = {}, S_LANES = [], S_LANE_NEWDIR = "", S_GATE = null, S_SPEND = null, S_ADD = [], S_REMOVE = [];
+function cfgDirty() {
+  try {
+    const snap = JSON.stringify({ a: S_AGENTS, c: S_CODERS, f: S_FB, l: S_LANES, nd: S_LANE_NEWDIR, g: S_GATE, s: S_SPEND, add: S_ADD, rem: S_REMOVE });
+    return snap !== CFG_ORIG;
+  } catch (e) { return false; }
+}
+function cfgSummary() {
+  const parts = [];
+  try {
+    if (S_ADD.length) parts.push("add " + S_ADD.map(a => a.id).join(","));
+    if (S_REMOVE.length) parts.push("remove " + S_REMOVE.join(","));
+    const o = JSON.parse(CFG_ORIG || "{}");
+    for (const [id, a] of Object.entries(S_AGENTS)) {
+      const was = (o.a || {})[id] || {};
+      if (JSON.stringify(a) !== JSON.stringify(was)) parts.push("edit " + id);
+    }
+    if (JSON.stringify(S_CODERS) !== JSON.stringify(o.c || [])) parts.push("reorder coders");
+    if (JSON.stringify(S_FB) !== JSON.stringify(o.f || {})) parts.push("fallbacks");
+    if (JSON.stringify(S_LANES) !== JSON.stringify(o.l || []) || (S_LANE_NEWDIR && S_LANE_NEWDIR !== (o.nd || ""))) parts.push("lanes");
+    if (JSON.stringify(S_GATE) !== JSON.stringify(o.g || null)) parts.push("approval gate");
+    if (JSON.stringify(S_SPEND) !== JSON.stringify(o.s || null)) parts.push("spend cap");
+  } catch (e) {}
+  return parts.join(" · ") || "";
+}
+function cfgMarkDirty() {
+  try {
+    const dirty = cfgDirty();
+    const sv = document.getElementById("btnSettingsSave"), rv = document.getElementById("btnSettingsRevert"), sm = document.getElementById("settingsSummary");
+    if (sv) sv.disabled = !dirty;
+    if (rv) rv.disabled = !dirty;
+    if (sm) sm.textContent = dirty ? ("Pending: " + cfgSummary()) : "";
+  } catch (e) {}
+}
+async function refreshSettings() {
+  const box = document.getElementById("settingsView");
+  if (!box) return;
+  try {
+    const r = await api("api/config", { cache: "no-store" });
+    if (!r.ok) {
+      const t = document.getElementById("settingsSummary");
+      if (t) t.textContent = r.status === 403 ? "Settings needs manage mode." : "Settings unavailable.";
+      return;
+    }
+    const d = await r.json();
+    CFG = d.config || {}; CFG_MTIME = d.mtime || 0; CFG_MODELS = d.models || [];
+    const agents = CFG.agents || {};
+    const paid = new Set(CFG.paid_agents || CFG.paid || []);
+    const coders = CFG.coders || [];
+    const roles = CFG.roles || {};
+    const roleOf = {};
+    for (const [rk, who] of Object.entries(roles)) roleOf[who] = rk;
+    S_AGENTS = {};
+    for (const [id, a] of Object.entries(agents)) {
+      S_AGENTS[id] = { model: a.model || "", account: a.account || id, label: a.label || id,
+        kind: a.kind || (d.kinds && d.kinds[id]) || "?", coder: coders.includes(id),
+        paid: paid.has(id) || (d.paid && d.paid[id]), role: roleOf[id] || "",
+        benched: (CFG.disabled_agents || []).includes(id) };
+    }
+    S_CODERS = [...coders];
+    S_FB = JSON.parse(JSON.stringify(CFG.fallback || {}));
+    S_FB_PAIDLAST = {};
+    for (const k of Object.keys(S_FB)) S_FB_PAIDLAST[k] = true;
+    S_LANES = JSON.parse(JSON.stringify(CFG.lanes || []));
+    S_LANE_NEWDIR = "";
+    S_GATE = JSON.parse(JSON.stringify(CFG.approval_gate || { enabled: false, types: [], workers: [], timeout_minutes: 0 }));
+    S_SPEND = JSON.parse(JSON.stringify(CFG.spend_cap || { daily_usd: 0, agents: [] }));
+    S_ADD = []; S_REMOVE = [];
+    CFG_ORIG = JSON.stringify({ a: S_AGENTS, c: S_CODERS, f: S_FB, l: S_LANES, nd: S_LANE_NEWDIR, g: S_GATE, s: S_SPEND, add: S_ADD, rem: S_REMOVE });
+    const rb = document.getElementById("restartBanner");
+    if (rb) rb.hidden = true;
+  } catch (e) { return; }
+  paintSettingsTeam(); paintSettingsFallbacks(); paintSettingsLanes(); paintSettingsGate(); paintSettingsSpend();
+  cfgMarkDirty();
+}
+function sortPaidLast(chain) {
+  const paid = new Set([...(CFG.paid_agents || CFG.paid || [])]);
+  return [...chain].sort((a, b) => ((paid.has(a) ? 1 : 0) - (paid.has(b) ? 1 : 0)));
+}
+function paintSettingsTeam() {
+  const box = document.getElementById("settingsTeam");
+  if (!box) return;
+  box.replaceChildren();
+  const accts = [...new Set(Object.values(S_AGENTS).map(a => a.account))];
+  const dl = document.createElement("datalist"); dl.id = "cfgModels";
+  for (const m of CFG_MODELS) { const o = document.createElement("option"); o.value = m; dl.appendChild(o); }
+  box.appendChild(dl);
+  for (const id of Object.keys(S_AGENTS)) {
+    const a = S_AGENTS[id];
+    const card = document.createElement("div"); card.className = "setcard";
+    const top = document.createElement("div"); top.className = "row btns";
+    try {
+      const av = document.createElement("canvas"); av.width = 15; av.height = 23;
+      av.getContext("2d").drawImage(makeSprite(id, 0), 0, 0);
+      top.appendChild(av);
+    } catch (e) {}
+    const nm = document.createElement("strong"); nm.textContent = shortName(id) + " · " + id;
+    top.appendChild(nm);
+    if (a.benched) { const b = document.createElement("span"); b.className = "badge"; b.textContent = "benched"; top.appendChild(b); }
+    if (a.role) { const b = document.createElement("span"); b.className = "badge"; b.textContent = a.role; top.appendChild(b); }
+    card.appendChild(top);
+    const grid = document.createElement("div"); grid.className = "setgrid";
+    const labL = document.createElement("label"); labL.textContent = "Label ";
+    const labI = document.createElement("input"); labI.value = a.label; labI.maxLength = 40;
+    labI.addEventListener("input", () => { a.label = labI.value; cfgMarkDirty(); });
+    labL.appendChild(labI); grid.appendChild(labL);
+    const kindS = document.createElement("span"); kindS.className = "muted"; kindS.textContent = "kind " + a.kind;
+    grid.appendChild(kindS);
+    const modL = document.createElement("label"); modL.textContent = "Model ";
+    const modI = document.createElement("input"); modI.value = a.model;
+    if (a.kind === "opencode") modI.setAttribute("list", "cfgModels");
+    modI.addEventListener("input", () => { a.model = modI.value; cfgMarkDirty(); });
+    modL.appendChild(modI); grid.appendChild(modL);
+    const accL = document.createElement("label"); accL.textContent = "Account ";
+    const accS = document.createElement("select");
+    for (const ac of accts) { const o = document.createElement("option"); o.value = ac; o.textContent = ac; accS.appendChild(o); }
+    const no = document.createElement("option"); no.value = "__new"; no.textContent = "new…"; accS.appendChild(no);
+    accS.value = accts.includes(a.account) ? a.account : "__new";
+    const accI = document.createElement("input"); accI.placeholder = "new account"; accI.hidden = accS.value !== "__new";
+    if (!accts.includes(a.account)) accI.value = a.account;
+    accS.addEventListener("change", () => { if (accS.value === "__new") { accI.hidden = false; } else { accI.hidden = true; a.account = accS.value; cfgMarkDirty(); } });
+    accI.addEventListener("input", () => { a.account = accI.value; cfgMarkDirty(); });
+    accL.appendChild(accS); accL.appendChild(accI); grid.appendChild(accL);
+    card.appendChild(grid);
+    const row = document.createElement("div"); row.className = "row btns";
+    const coderL = document.createElement("label"); coderL.className = "row";
+    const coderC = document.createElement("input"); coderC.type = "checkbox"; coderC.checked = !!a.coder;
+    coderC.addEventListener("change", () => {
+      a.coder = coderC.checked;
+      if (a.coder && !S_CODERS.includes(id)) S_CODERS.push(id);
+      if (!a.coder) S_CODERS = S_CODERS.filter(c => c !== id);
+      paintSettingsTeam(); cfgMarkDirty();
+    });
+    coderL.append(coderC, document.createTextNode(" coder")); row.appendChild(coderL);
+    const paidL = document.createElement("label"); paidL.className = "row";
+    const paidC = document.createElement("input"); paidC.type = "checkbox"; paidC.checked = !!a.paid;
+    paidC.addEventListener("change", () => { a.paid = paidC.checked; cfgMarkDirty(); });
+    paidL.append(paidC, document.createTextNode(" paid")); row.appendChild(paidL);
+    if (a.coder) {
+      const up = document.createElement("button"); up.type = "button"; up.textContent = "▲"; up.title = "coder order up";
+      up.addEventListener("click", () => { const i = S_CODERS.indexOf(id); if (i > 0) { [S_CODERS[i - 1], S_CODERS[i]] = [S_CODERS[i], S_CODERS[i - 1]]; cfgMarkDirty(); } });
+      const dn = document.createElement("button"); dn.type = "button"; dn.textContent = "▼"; dn.title = "coder order down";
+      dn.addEventListener("click", () => { const i = S_CODERS.indexOf(id); if (i >= 0 && i < S_CODERS.length - 1) { [S_CODERS[i + 1], S_CODERS[i]] = [S_CODERS[i], S_CODERS[i + 1]]; cfgMarkDirty(); } });
+      row.append(up, dn);
+    }
+    const bb = document.createElement("button"); bb.type = "button"; bb.textContent = a.benched ? "Unbench" : "Bench";
+    bb.addEventListener("click", (e) => runAction(e.target, "api/command", a.benched ? { action: "unbench", agent: id } : { action: "bench", agent: id }).then(() => setTimeout(refreshSettings, 1200)));
+    row.appendChild(bb);
+    const rm = document.createElement("button"); rm.type = "button"; rm.textContent = "Remove"; rm.className = "danger";
+    rm.addEventListener("click", () => {
+      if (S_ADD.some(x => x.id === id)) { S_ADD = S_ADD.filter(x => x.id !== id); delete S_AGENTS[id]; }
+      else { S_REMOVE.push(id); delete S_AGENTS[id]; }
+      S_CODERS = S_CODERS.filter(c => c !== id);
+      for (const k of Object.keys(S_FB)) S_FB[k] = (S_FB[k] || []).filter(m => m !== id);
+      paintSettingsTeam(); paintSettingsFallbacks(); cfgMarkDirty();
+    });
+    row.appendChild(rm);
+    card.appendChild(row);
+    box.appendChild(card);
+  }
+  const fbSel = document.getElementById("fbAgent");
+  if (fbSel) fbSel.replaceChildren(...Object.keys(S_AGENTS).map(id => Object.assign(document.createElement("option"), { value: id, textContent: id })));
+}
+function paintSettingsFallbacks() {
+  const box = document.getElementById("settingsFallbacks");
+  if (!box) return;
+  box.replaceChildren();
+  const ids = Object.keys(S_AGENTS);
+  for (const key of Object.keys(S_FB)) {
+    const [holder, step] = key.split(":");
+    const row = document.createElement("div"); row.className = "fbrow";
+    const title = document.createElement("strong"); title.textContent = key + " ";
+    row.appendChild(title);
+    const chain = S_FB[key] || [];
+    chain.forEach((m, i) => {
+      const chip = document.createElement("span"); chip.className = "chip";
+      const paid = (CFG.paid_agents || CFG.paid || []).includes(m) || (S_AGENTS[m] && S_AGENTS[m].paid);
+      chip.textContent = m + (paid ? " (paid)" : "");
+      row.appendChild(chip);
+      const up = document.createElement("button"); up.type = "button"; up.textContent = "▲";
+      up.addEventListener("click", () => { if (i > 0) { [chain[i - 1], chain[i]] = [chain[i], chain[i - 1]]; if (S_FB_PAIDLAST[key]) S_FB[key] = sortPaidLast(chain); paintSettingsFallbacks(); cfgMarkDirty(); } });
+      const dn = document.createElement("button"); dn.type = "button"; dn.textContent = "▼";
+      dn.addEventListener("click", () => { if (i < chain.length - 1) { [chain[i + 1], chain[i]] = [chain[i], chain[i + 1]]; if (S_FB_PAIDLAST[key]) S_FB[key] = sortPaidLast(chain); paintSettingsFallbacks(); cfgMarkDirty(); } });
+      const x = document.createElement("button"); x.type = "button"; x.textContent = "✕";
+      x.addEventListener("click", () => { chain.splice(i, 1); paintSettingsFallbacks(); cfgMarkDirty(); });
+      row.append(up, dn, x);
+    });
+    const rest = ids.filter(a => !chain.includes(a));
+    if (rest.length) {
+      const sel = document.createElement("select");
+      sel.appendChild(Object.assign(document.createElement("option"), { value: "", textContent: "+ add" }));
+      for (const r of rest) sel.appendChild(Object.assign(document.createElement("option"), { value: r, textContent: r }));
+      sel.addEventListener("change", () => { if (sel.value) { chain.push(sel.value); if (S_FB_PAIDLAST[key]) S_FB[key] = sortPaidLast(chain); paintSettingsFallbacks(); cfgMarkDirty(); } });
+      row.appendChild(sel);
+    }
+    const pl = document.createElement("label"); pl.className = "row";
+    const pc = document.createElement("input"); pc.type = "checkbox"; pc.checked = S_FB_PAIDLAST[key] !== false;
+    pc.addEventListener("change", () => { S_FB_PAIDLAST[key] = pc.checked; if (pc.checked) S_FB[key] = sortPaidLast(chain); paintSettingsFallbacks(); cfgMarkDirty(); });
+    pl.append(pc, document.createTextNode(" Paid last")); row.appendChild(pl);
+    const del = document.createElement("button"); del.type = "button"; del.textContent = "Delete rule";
+    del.addEventListener("click", () => { delete S_FB[key]; paintSettingsFallbacks(); cfgMarkDirty(); });
+    row.appendChild(del);
+    const prev = document.createElement("div"); prev.className = "muted";
+    prev.textContent = chain.length ? `If ${holder} is limited, ${step} goes to ${chain.join(", then ")}` : `No fallback for ${key}`;
+    row.appendChild(prev);
+    box.appendChild(row);
+  }
+}
+function paintSettingsLanes() {
+  const box = document.getElementById("settingsLanes");
+  if (!box) return;
+  box.replaceChildren();
+  const total = S_LANES.length + 1;
+  const info = document.createElement("div"); info.className = "muted";
+  info.textContent = `Total lanes: ${total} (A + ${S_LANES.length} worktrees). Takes effect at restart; worktrees are created by the orchestrator.`;
+  box.appendChild(info);
+  const row = document.createElement("div"); row.className = "row btns";
+  const minus = document.createElement("button"); minus.type = "button"; minus.textContent = "−"; minus.disabled = total <= 1;
+  minus.addEventListener("click", () => { if (S_LANES.length) { S_LANES.pop(); paintSettingsLanes(); cfgMarkDirty(); } });
+  const cnt = document.createElement("span"); cnt.textContent = String(total);
+  const plus = document.createElement("button"); plus.type = "button"; plus.textContent = "+"; plus.disabled = total >= 6;
+  plus.addEventListener("click", () => {
+    if (S_LANES.length >= 5) return;
+    const letter = String.fromCharCode(66 + S_LANES.length);
+    let dir = "";
+    if (S_LANES.length) {
+      const prev = S_LANES[S_LANES.length - 1].dir || "";
+      const m = /^(.*)([A-Za-z])$/.exec(prev.replace(/\/$/, ""));
+      dir = m ? (m[1] + letter) : (prev + letter);
+    } else dir = S_LANE_NEWDIR || "";
+    if (!dir) { toast("Enter a dir below first"); return; }
+    S_LANES.push({ name: letter, dir });
+    paintSettingsLanes(); cfgMarkDirty();
+  });
+  row.append(minus, cnt, plus);
+  box.appendChild(row);
+  const list = document.createElement("div"); list.className = "muted";
+  list.textContent = ["A (main checkout)", ...S_LANES.map(l => `${l.name}: ${l.dir}`)].join(" · ");
+  box.appendChild(list);
+  if (!S_LANES.length) {
+    const lab = document.createElement("label"); lab.textContent = "Dir for lane B (absolute path, outside OneDrive) ";
+    const inp = document.createElement("input"); inp.value = S_LANE_NEWDIR; inp.placeholder = "C:/work/game_laneB";
+    const hint = document.createElement("div"); hint.className = "muted";
+    inp.addEventListener("input", () => {
+      S_LANE_NEWDIR = inp.value;
+      hint.textContent = /OneDrive/.test(inp.value) ? "Lane dirs must be outside OneDrive." : (!inp.value || !/^[A-Za-z]:[\\/]|^\//.test(inp.value) ? "Must be an absolute path." : "");
+      cfgMarkDirty();
+    });
+    lab.appendChild(inp); box.append(lab, hint);
+  }
+}
+function paintSettingsGate() {
+  const box = document.getElementById("settingsGate");
+  if (!box || !S_GATE) return;
+  box.replaceChildren();
+  const en = document.createElement("label"); en.className = "row";
+  const ec = document.createElement("input"); ec.type = "checkbox"; ec.checked = !!S_GATE.enabled;
+  ec.addEventListener("change", () => { S_GATE.enabled = ec.checked; cfgMarkDirty(); });
+  en.append(ec, document.createTextNode(" enabled")); box.appendChild(en);
+  const mkMulti = (label, all, sel, cb) => {
+    const w = document.createElement("div"); w.textContent = label + " ";
+    const s = document.createElement("select"); s.multiple = true; s.size = Math.min(5, Math.max(2, all.length));
+    for (const a of all) { const o = document.createElement("option"); o.value = a; o.textContent = a; if ((sel || []).includes(a)) o.selected = true; s.appendChild(o); }
+    s.addEventListener("change", () => cb([...s.selectedOptions].map(o => o.value)));
+    w.appendChild(s); box.appendChild(w);
+  };
+  mkMulti("Types", ["code", "asset", "design", "qa"], S_GATE.types, v => { S_GATE.types = v; cfgMarkDirty(); });
+  mkMulti("Workers", Object.keys(S_AGENTS), S_GATE.workers, v => { S_GATE.workers = v; cfgMarkDirty(); });
+  const t = document.createElement("label"); t.textContent = "Timeout (min) ";
+  const ti = document.createElement("input"); ti.type = "number"; ti.min = "0"; ti.value = S_GATE.timeout_minutes ?? 0;
+  ti.addEventListener("input", () => { S_GATE.timeout_minutes = +ti.value || 0; cfgMarkDirty(); });
+  t.appendChild(ti); box.appendChild(t);
+}
+function paintSettingsSpend() {
+  const box = document.getElementById("settingsSpend");
+  if (!box || !S_SPEND) return;
+  box.replaceChildren();
+  const t = document.createElement("label"); t.textContent = "Daily USD ";
+  const ti = document.createElement("input"); ti.type = "number"; ti.min = "0"; ti.step = "0.5"; ti.value = S_SPEND.daily_usd ?? 0;
+  ti.addEventListener("input", () => { S_SPEND.daily_usd = +ti.value || 0; cfgMarkDirty(); });
+  t.appendChild(ti); box.appendChild(t);
+  const w = document.createElement("div"); w.textContent = "Agents ";
+  const s = document.createElement("select"); s.multiple = true; s.size = Math.min(6, Math.max(2, Object.keys(S_AGENTS).length));
+  for (const a of Object.keys(S_AGENTS)) { const o = document.createElement("option"); o.value = a; o.textContent = a; if ((S_SPEND.agents || []).includes(a)) o.selected = true; s.appendChild(o); }
+  s.addEventListener("change", () => { S_SPEND.agents = [...s.selectedOptions].map(o => o.value); cfgMarkDirty(); });
+  w.appendChild(s); box.appendChild(w);
+  const n = document.createElement("div"); n.className = "muted"; n.textContent = "Takes effect at restart.";
+  box.appendChild(n);
+}
+async function saveSettings(btn) {
+  if (!CFG) return;
+  try {
+    const o = JSON.parse(CFG_ORIG || "{}");
+    const changes = {};
+    const agentDiff = {};
+    for (const [id, a] of Object.entries(S_AGENTS)) {
+      if (o.a && o.a[id] && JSON.stringify(a) === JSON.stringify(o.a[id])) continue;
+      if (S_ADD.some(x => x.id === id)) continue;
+      const d = {};
+      const was = (o.a || {})[id] || {};
+      if (a.model !== was.model) d.model = a.model;
+      if (a.account !== was.account) d.account = a.account;
+      if (a.label !== was.label) d.label = a.label;
+      if (a.coder !== was.coder) d.coder = a.coder;
+      if (a.paid !== was.paid) d.paid = a.paid;
+      if (Object.keys(d).length) agentDiff[id] = d;
+    }
+    if (Object.keys(agentDiff).length) changes.agents = agentDiff;
+    if (S_ADD.length) changes.add = S_ADD;
+    if (S_REMOVE.length) changes.remove = S_REMOVE;
+    if (JSON.stringify(S_CODERS) !== JSON.stringify(o.c || [])) changes.coders = S_CODERS;
+    if (JSON.stringify(S_FB) !== JSON.stringify(o.f || {})) changes.fallback = S_FB;
+    if (JSON.stringify(S_LANES) !== JSON.stringify(o.l || []) || (S_LANE_NEWDIR && S_LANE_NEWDIR !== (o.nd || ""))) {
+      changes.lanes = { count: S_LANES.length + 1 };
+      if (!((CFG.lanes || []).length) && S_LANE_NEWDIR) changes.lanes.new_dir = S_LANE_NEWDIR;
+    }
+    if (JSON.stringify(S_GATE) !== JSON.stringify(o.g || null)) changes.approval_gate = S_GATE;
+    if (JSON.stringify(S_SPEND) !== JSON.stringify(o.s || null)) changes.spend_cap = S_SPEND;
+    if (btn) btn.disabled = true;
+    const r = await api("api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ base_mtime: CFG_MTIME, changes }) });
+    let d = {};
+    try { d = await r.json(); } catch (e) {}
+    if (r.status === 409 && /changed/.test(d.error || "")) { toast("config changed - reloading"); await refreshSettings(); return; }
+    if (!r.ok) { toast(d.error || ("Error " + r.status)); if (btn) btn.disabled = false; cfgMarkDirty(); return; }
+    toast("Saved");
+    CFG_MTIME = d.mtime || CFG_MTIME;
+    CFG_ORIG = JSON.stringify({ a: S_AGENTS, c: S_CODERS, f: S_FB, l: S_LANES, nd: S_LANE_NEWDIR, g: S_GATE, s: S_SPEND, add: [], rem: [] });
+    S_ADD = [];
+    const rb = document.getElementById("restartBanner");
+    if (rb) rb.hidden = !(d.restart_needed);
+    cfgMarkDirty(); pollSoon();
+  } catch (e) { toast("Save failed"); }
+}
+try {
+  const _sb = document.getElementById("btnSettingsSave");
+  if (_sb) _sb.addEventListener("click", (e) => saveSettings(e.target));
+  const _rb2 = document.getElementById("btnSettingsRevert");
+  if (_rb2) _rb2.addEventListener("click", () => refreshSettings());
+  const _ap = document.getElementById("btnAddPos");
+  if (_ap) _ap.addEventListener("click", () => {
+    try {
+      const kind = document.getElementById("addKind").value, id = document.getElementById("addId").value.trim();
+      const model = document.getElementById("addModel").value.trim(), account = document.getElementById("addAccount").value.trim();
+      if (!/^[a-z][a-z0-9_]{1,30}$/.test(id)) { toast("bad agent id"); return; }
+      if (S_AGENTS[id]) { toast("duplicate agent id"); return; }
+      S_AGENTS[id] = { model, account: account || id, label: id, kind, coder: false, paid: false, role: "", benched: false };
+      S_ADD.push({ id, kind, model, account: account || id, label: id });
+      document.getElementById("addId").value = ""; document.getElementById("addModel").value = ""; document.getElementById("addAccount").value = "";
+      paintSettingsTeam(); cfgMarkDirty();
+    } catch (e) {}
+  });
+  const _ar = document.getElementById("btnAddRule");
+  if (_ar) _ar.addEventListener("click", () => {
+    try {
+      const a = document.getElementById("fbAgent").value, s = document.getElementById("fbStep").value;
+      const k = a + ":" + s;
+      if (!S_FB[k]) { S_FB[k] = []; S_FB_PAIDLAST[k] = true; paintSettingsFallbacks(); cfgMarkDirty(); }
+    } catch (e) {}
+  });
+  const _rn = document.getElementById("btnRestartNow");
+  if (_rn) _rn.addEventListener("click", (e) => runAction(e.target, "api/control", { action: "restart" }));
+} catch (e) {}
+// ---- approvals
+let APPROVALS = [];
+async function refreshApprovals() {
+  try {
+    const r = await api("api/approvals", { cache: "no-store" });
+    if (!r.ok) return;
+    const d = await r.json();
+    APPROVALS = d.pending || [];
+  } catch (e) { return; }
+  paintApprovalsBadge(); paintApprovalsModal();
+}
+function paintApprovalsBadge() {
+  try {
+    const b = document.getElementById("approvalsBadge");
+    if (!b) return;
+    b.hidden = !APPROVALS.length;
+    b.textContent = `✋ ${APPROVALS.length} awaiting approval`;
+  } catch (e) {}
+}
+function paintApprovalsModal() {
+  try {
+    const box = document.getElementById("approvalsCards");
+    if (!box) return;
+    const manage = !!(STATE && STATE.manage);
+    box.replaceChildren();
+    if (!APPROVALS.length) { box.textContent = "Nothing awaiting approval."; return; }
+    for (const req of APPROVALS) {
+      const card = document.createElement("div"); card.className = "acard";
+      const t = document.createElement("strong"); t.textContent = `${req.task || ""} · ${req.title || ""}`;
+      card.appendChild(t);
+      const m = document.createElement("div"); m.className = "muted";
+      m.textContent = `worker ${req.worker || ""} · lane ${req.lane || ""} · attempt ${req.attempt ?? ""}`;
+      card.appendChild(m);
+      if (req.review_summary) { const p = document.createElement("p"); p.textContent = "Review: " + req.review_summary; card.appendChild(p); }
+      if (req.qa_verdict) { const p = document.createElement("p"); p.textContent = "QA: " + req.qa_verdict; card.appendChild(p); }
+      if (req.checks_summary) { const p = document.createElement("p"); p.textContent = "Checks: " + req.checks_summary; card.appendChild(p); }
+      if (req.screenshot) {
+        const img = document.createElement("img"); img.style.maxWidth = "100%";
+        img.src = "api/file?path=" + encodeURIComponent(req.screenshot); img.alt = "screenshot"; img.loading = "lazy";
+        img.addEventListener("click", () => { try { document.getElementById("lightImg").src = img.src; document.getElementById("lightbox").hidden = false; } catch (e) {} });
+        card.appendChild(img);
+      }
+      if (req.patch) {
+        const b = document.createElement("button"); b.type = "button"; b.className = "flink"; b.textContent = "📄 " + req.patch;
+        b.addEventListener("click", async () => {
+          try {
+            const r = await fetch("api/file?path=" + encodeURIComponent(req.patch), { cache: "no-store" });
+            const text = await r.text();
+            openDrawer(req.task);
+            setTimeout(() => { try { $d("fileName").textContent = req.patch; $d("filePre").textContent = text.slice(0, 20000); $d("paneBrief").hidden = $d("paneAccept").hidden = $d("paneAttempts").hidden = $d("paneLive").hidden = true; $d("paneFile").hidden = false; } catch (e) {} }, 400);
+          } catch (e) {}
+        });
+        card.appendChild(b); card.appendChild(document.createElement("br"));
+      }
+      if (manage) {
+        const fb = document.createElement("input"); fb.placeholder = "feedback (required for Request changes)"; fb.style.width = "100%";
+        card.appendChild(fb);
+        const row = document.createElement("div"); row.className = "row btns";
+        const ok = document.createElement("button"); ok.type = "button"; ok.textContent = "Approve";
+        ok.addEventListener("click", async (e) => {
+          e.target.disabled = true;
+          try {
+            const r = await api("api/approval", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: req.task, decision: "approve", feedback: "" }) });
+            const d = await r.json().catch(() => ({}));
+            toast(r.ok ? "Approved" : (d.error || ("Error " + r.status)));
+            if (r.ok) refreshApprovals();
+          } catch (ex) { toast("Office server offline"); }
+          e.target.disabled = false;
+        });
+        const rev = document.createElement("button"); rev.type = "button"; rev.textContent = "Request changes";
+        rev.addEventListener("click", async (e) => {
+          if (!fb.value.trim()) { toast("feedback required"); return; }
+          e.target.disabled = true;
+          try {
+            const r = await api("api/approval", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: req.task, decision: "revise", feedback: fb.value.trim() }) });
+            const d = await r.json().catch(() => ({}));
+            toast(r.ok ? "Sent back" : (d.error || ("Error " + r.status)));
+            if (r.ok) refreshApprovals();
+          } catch (ex) { toast("Office server offline"); }
+          e.target.disabled = false;
+        });
+        row.append(ok, rev); card.appendChild(row);
+      }
+      box.appendChild(card);
+    }
+  } catch (e) {}
+}
+try {
+  const _ab = document.getElementById("approvalsBadge");
+  if (_ab) _ab.addEventListener("click", () => { const m = document.getElementById("approvalsModal"); if (m) m.hidden = false; });
+  const _ax = document.getElementById("approvalsX");
+  if (_ax) _ax.addEventListener("click", () => { document.getElementById("approvalsModal").hidden = true; });
+  const _am = document.getElementById("approvalsModal");
+  if (_am) _am.addEventListener("click", (e) => { if (e.target === _am) _am.hidden = true; });
+} catch (e) {}
+setInterval(() => { try { refreshApprovals(); } catch (e) {} }, 10000);
+try {
+  const _da = document.getElementById("dApproval");
+  if (_da) _da.addEventListener("change", () => {
+    if (!drawerTask) return;
+    runAction(_da, "api/command", { action: "set_approval", task: drawerTask, required: !!_da.checked });
+  });
+} catch (e) {}
+const _renderSide3 = renderSide;
+renderSide = function (st) {
+  _renderSide3(st);
+  try {
+    const vs = document.getElementById("viewSettings");
+    if (vs) vs.hidden = !st.manage;
+    if (VIEW === "settings" && !st.manage) setView("office");
+    if (VIEW === "settings") refreshSettings();
+    if (st.approvals) { APPROVALS = st.approvals; paintApprovalsBadge(); paintApprovalsModal(); }
+    else refreshApprovals();
+    try {
+      const cb = document.getElementById("controlbar");
+      const btn = document.getElementById("btnPlay");
+      if (st.manage && btn && !btn.hidden && cb && btn.parentElement !== cb) cb.appendChild(btn);
+    } catch (e) {}
+  } catch (e) {}
+};

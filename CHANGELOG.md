@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.2.0 (unreleased)
+## 1.2.0 (2026-10-18)
 
 The Office grows a manage mode (`office-manage.bat` / `office/server.py --manage`): token-URL auth
 plus a localhost-only host check, a header control bar (Plan now, Restart, Stop, Start, cancellable
@@ -25,6 +25,24 @@ while the team runs. Polish: drawer ✕ is a small top-right icon, one shared bu
 variant for Drop/Stop), done/in-progress drawers show the real disabled status with no Drop, graph
 nodes show id + ~18 chars of title. `--demo` returns seeded data (30 tasks, growing tail, 3 days of
 stats, notes, spend) for every Phase 2/3 read endpoint while keeping the timeline empty and POSTs 409.
+
+Phase 4: Settings, approvals and spend cap. The manage-mode header gains a **Settings** view
+(Team, Fallbacks, Lanes, Approval gate, Spend cap; `?view=settings`) backed by `GET`/`POST
+/api/config` (stale-write 409, `config.backups/` newest 20, atomic write, `OFFICE config changed`
+event; model edits only replace the value after `-m`/`--model`). `bench`/`unbench` inbox
+commands park positions live (no restart; 🪑 lounge bubble, fallback cover, `BENCH`/`UNBENCH`
+events, persisted to config.json). The approval gate (`approval_gate` + per-task
+`needs_approval` via `set_approval`) pauses lane commits on `APPROVAL WAIT`, waits on
+`project/approvals/T-x.json` with STOP-aware polling (`await_approval`, auto-approve on
+`timeout_minutes`), and records `APPROVAL`/`APPROVAL TIMEOUT` events; the Office adds an ✋
+badge with an Approvals modal (`GET /api/approvals` read-only, `POST /api/approval`) and a
+"Require my approval" drawer checkbox. The spend cap (`spend_cap`, `opencode stats --days 1
+--models` cached 5 min) parks pay-per-use accounts until midnight with one `SPEND CAP` event
+per day (💸 bubble, amber/red meter in Stats → Quota and cost). Polish: throughput 0 at the
+baseline with gridlines (≤220 px), burndown axes/legend/ticks, lane timeline without the stray
+header and "now" on top, content-sized curved routing ribbons, demo spend rows that sum to the
+total, inline ▶ Play, left→right graph layers with edge-to-edge routing and fit-to-width, and
+deterministic tests (deadline polling, explicit `os.utime`).
 
 ## 1.1.0 (2026-10-18)
 

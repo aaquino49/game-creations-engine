@@ -45,6 +45,11 @@ def demo_state(scene="auto"):
                              "task": task, "title": title, "type": "code"})
         jobs.append({"agent": "quarterback", "station": "plan", "step": "plan", "task": "",
                      "title": "A cozy lounge and a very good office dog"})
+    for a in agents:
+        if a["id"] == "coder_3":
+            a["benched"] = True
+        else:
+            a["benched"] = False
     if scene in ("working", "limits"):
         for a in agents:
             if a["id"] in ("coder_2", "coder_4"):
@@ -78,6 +83,8 @@ def demo_state(scene="auto"):
             "orchestrator": scene != "closed", "supervisor": scene != "closed", "flags": [],
             "now": "Simulated activity", "lanes": lanes, "jobs": jobs, "agents": agents,
             "accounts": accounts,
+            "approvals": demo_approvals()["pending"],
+            "approval_wait": [r["task"] for r in demo_approvals()["pending"]],
             "planner": {"busy": scene in ("working", "checks")}, "supervisor_msg": "Demo patrol",
             "milestones": [{"id": "M1", "title": "Open the studio", "done": 12, "total": 12, "active": 0, "blocked": 0},
                            {"id": "M2", "title": "Bring the office to life", "done": 18 if scene == "complete" else 11,
@@ -210,21 +217,31 @@ def demo_stats(hours=24):
                 "count": (i * 7 + hours) % 4} for i in range(n)]
     series = [{"t": (start + dt.timedelta(hours=i * bh)).strftime("%Y-%m-%d %H:%M:%S"),
                "open": {"M1": max(0, 4 - i // 4), "M2": 8, "M3": 10}} for i in range(n + 1)]
-    gantt = {"lanes": [{"lane": "A", "bars": [
-        {"task": "T-1", "title": "Menu polish",
-         "start": (now - dt.timedelta(hours=5)).strftime("%Y-%m-%d %H:%M:%S"),
-         "end": (now - dt.timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S"),
-         "outcome": "done", "attempts": 1, "duration_min": 120.0},
-        {"task": "T-2", "title": "Save slots",
-         "start": (now - dt.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S"),
-         "end": now.strftime("%Y-%m-%d %H:%M:%S"),
-         "outcome": "running", "attempts": 2, "duration_min": 120.0}]},
-        {"lane": "B", "bars": []}],
-        "naps": [{"account": "openai", "bars": [
-            {"start": (now - dt.timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S"),
-             "end": (now - dt.timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S"),
-             "reason": "USAGE LIMIT", "hours": 3.0}]}],
-        "now": now.strftime("%Y-%m-%d %H:%M:%S")}
+    gantt_bars_a = []
+    gantt_bars_b = []
+    for i in range(5):
+        s = now - dt.timedelta(hours=23 - i * 4)
+        e = s + dt.timedelta(hours=3)
+        gantt_bars_a.append({"task": f"T-{10 + i}", "title": _TITLES[i],
+                             "start": s.strftime("%Y-%m-%d %H:%M:%S"),
+                             "end": e.strftime("%Y-%m-%d %H:%M:%S"),
+                             "outcome": "done", "attempts": 1, "duration_min": 180.0})
+    for i in range(4):
+        s = now - dt.timedelta(hours=21 - i * 5)
+        e = s + dt.timedelta(hours=4)
+        gantt_bars_b.append({"task": f"T-{15 + i}", "title": _TITLES[5 + i],
+                             "start": s.strftime("%Y-%m-%d %H:%M:%S"),
+                             "end": e.strftime("%Y-%m-%d %H:%M:%S"),
+                             "outcome": "done" if i < 3 else "running",
+                             "attempts": 2, "duration_min": 240.0})
+    gantt_bars_b[-1]["end"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    gantt = {"lanes": [{"lane": "A", "bars": gantt_bars_a},
+                       {"lane": "B", "bars": gantt_bars_b}],
+             "naps": [{"account": "openai", "bars": [
+                 {"start": (now - dt.timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S"),
+                  "end": (now - dt.timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S"),
+                  "reason": "USAGE LIMIT", "hours": 3.0}]}],
+             "now": now.strftime("%Y-%m-%d %H:%M:%S")}
     routing = {"flows": [{"from": "coder_2", "to": "coder_3", "count": 3},
                          {"from": "coder_1", "to": "coder_3", "count": 1}],
                "counts": {a: {"usage_limit": 1 if a == "coder_2" else 0, "preemptive": 0,
@@ -244,7 +261,13 @@ def demo_stats(hours=24):
     opencode = {"days1": {"total": 0.16, "models": {
         "meta/muse-spark-1.3-contributor": {"messages": 282, "input_tokens": 674300,
                                             "output_tokens": 193400, "cost": 0.1622}}},
-        "days7": {"total": 1.2, "models": {}},
+        "days7": {"total": 1.2, "models": {
+            "meta/muse-spark-1.3-contributor": {"messages": 900, "input_tokens": 2100000,
+                                               "output_tokens": 600000, "cost": 0.5},
+            "opencode/beam-free": {"messages": 700, "input_tokens": 1500000,
+                                   "output_tokens": 400000, "cost": 0.4},
+            "opencode/deepseek-v4.1-flash-free": {"messages": 500, "input_tokens": 900000,
+                                                 "output_tokens": 300000, "cost": 0.3}}},
         "error": None, "updated": time.time()}
     codex = {"primary": {"used_percent": 42.0, "window_minutes": 300, "resets_at": int(time.time()) + 3600},
              "secondary": {"used_percent": 11.0, "window_minutes": 10080, "resets_at": int(time.time()) + 86400}}
@@ -279,3 +302,62 @@ def demo_build():
     now = dt.datetime.now()
     return {"exe": "builds/demo-game.exe", "exists": True,
             "mtime": now.strftime("%Y-%m-%d %H:%M"), "size_mb": 42.5, "tag": "v1.0-demo"}
+
+
+# ------------------------------------------------------------------ phase 4 demo (settings + approvals)
+
+def demo_config():
+    """Settings view demo: roster, fallbacks, lanes, approval gate and spend cap."""
+    cfg = {
+        "agents": {
+            "quarterback": {"cmd": ["claude", "-p", "{prompt}", "--model", "claude-opus-5-5",
+                                    "--dangerously-skip-permissions"],
+                            "kind": "claude", "model": "claude-opus-5-5",
+                            "account": "anthropic", "label": "Quarterback"},
+            "qa_lead": {"cmd": ["codex", "exec", "-m", "gpt-6.1-sol",
+                                "--dangerously-bypass-approvals-and-sandbox",
+                                "--skip-git-repo-check", "{prompt}", "{images}"],
+                        "kind": "codex", "model": "gpt-6.1-sol",
+                        "account": "openai", "label": "QA lead"},
+            "coder_1": {"cmd": ["opencode", "run", "--auto", "-m",
+                                "meta/muse-spark-1.3-contributor", "{prompt}"],
+                        "kind": "opencode", "model": "meta/muse-spark-1.3-contributor",
+                        "account": "meta_api", "label": "Coder 1 (paid)"},
+            "coder_3": {"cmd": ["opencode", "run", "--auto", "-m",
+                                "opencode/beam-free", "{prompt}"],
+                        "kind": "opencode", "model": "opencode/beam-free",
+                        "account": "coder_3", "label": "Coder 3"},
+        },
+        "coders": ["coder_1", "coder_3"],
+        "paid_agents": ["coder_1"],
+        "roles": {"quarterback": "quarterback", "qa": "qa_lead"},
+        "fallback": {"coder_1:*": ["coder_3"], "coder_3:*": ["coder_1"]},
+        "disabled_agents": ["coder_3"],
+        "lanes": [{"name": "B", "dir": "C:/demo/gh_laneB"},
+                  {"name": "C", "dir": "C:/demo/gh_laneC"}],
+        "approval_gate": {"enabled": True, "types": ["code"], "workers": [],
+                          "timeout_minutes": 60},
+        "spend_cap": {"daily_usd": 5.0, "agents": ["coder_1"]},
+        "_notes": "Demo config (never written).",
+    }
+    agents = cfg["agents"]
+    return {"config": cfg, "mtime": 1729000000.0,
+            "models": ["meta/muse-spark-1.3-contributor", "opencode/beam-free",
+                       "gpt-6.1-sol", "claude-opus-5-5"],
+            "paid": {n: (n in cfg["paid_agents"]) for n in agents},
+            "kinds": {n: agents[n]["kind"] for n in agents}}
+
+
+def demo_approvals():
+    """One pending approval for the Approvals modal demo."""
+    now = dt.datetime.now()
+    return {"pending": [{
+        "task": "T-042", "title": "Make the little workers come alive",
+        "attempt": 1, "lane": "A", "worker": "coder_1",
+        "requested_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "summary": "Demo work summary.",
+        "review_summary": "Demo review: approve.",
+        "qa_verdict": "pass", "checks_summary": "12 passed",
+        "patch": "project/runs/T-042/a1/approval.patch",
+        "screenshot": "project/runs/T-042/a1/screenshot_shot1.png",
+    }]}

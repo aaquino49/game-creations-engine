@@ -19,6 +19,7 @@
     <button id="viewGraph" type="button" class="vbtn" aria-pressed="false">Graph</button>
     <button id="viewStats" type="button" class="vbtn" aria-pressed="false">Stats</button>
     <button id="viewNotes" type="button" class="vbtn" aria-pressed="false">Notes</button>
+    <button id="viewSettings" type="button" class="vbtn" aria-pressed="false" hidden>Settings</button>
     <button id="btnTimeline" type="button">Timeline</button>
   </nav>
   <div class="pills">
@@ -34,6 +35,7 @@
       </select>
     </label>
     <span class="pill" id="pill">connecting…</span>
+    <button id="approvalsBadge" type="button" hidden>✋ 0 awaiting approval</button>
     <span class="counts" id="counts"></span>
     <span class="clock" id="clock"></span>
   </div>
@@ -89,6 +91,36 @@
         <div class="notesdoc"><div class="muted" id="notesMeta"></div><pre class="prewrap" id="notesPre"></pre></div>
       </div>
     </section>
+    <section class="panel settingsview" id="settingsView" hidden>
+      <div class="row btns"><strong>Settings</strong><span class="sp"></span>
+        <button id="btnSettingsSave" type="button" disabled>Save</button>
+        <button id="btnSettingsRevert" type="button" disabled>Revert</button>
+      </div>
+      <div class="muted" id="settingsSummary"></div>
+      <div class="banner-like" id="restartBanner" hidden>Saved. Restart the team to apply <button id="btnRestartNow" type="button">Restart now</button></div>
+      <h3>Team</h3>
+      <div id="settingsTeam"></div>
+      <div class="row btns">
+        <label>Kind <select id="addKind"><option value="opencode">opencode</option><option value="claude">claude</option><option value="codex">codex</option></select></label>
+        <label>Id <input id="addId" placeholder="coder_5"></label>
+        <label>Model <input id="addModel" placeholder="model id"></label>
+        <label>Account <input id="addAccount" placeholder="account"></label>
+        <button id="btnAddPos" type="button">+ Add position</button>
+      </div>
+      <h3>Fallbacks</h3>
+      <div id="settingsFallbacks"></div>
+      <div class="row btns">
+        <label>Agent <select id="fbAgent"></select></label>
+        <label>Step <select id="fbStep"><option value="*">*</option><option value="work">work</option><option value="qa">qa</option><option value="plan">plan</option><option value="review">review</option><option value="work-qa">work-qa</option><option value="work-asset">work-asset</option></select></label>
+        <button id="btnAddRule" type="button">+ Add rule</button>
+      </div>
+      <h3>Lanes</h3>
+      <div id="settingsLanes"></div>
+      <h3>Approval gate</h3>
+      <div id="settingsGate"></div>
+      <h3>Spend cap</h3>
+      <div id="settingsSpend"></div>
+    </section>
   </section>
 
   <aside class="side">
@@ -141,6 +173,7 @@
     <div class="dactions" id="dActions" hidden>
       <label>Priority <select id="dPrio"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></label>
       <label>Status <select id="dStatusSel"><option value="backlog">Backlog</option><option value="ready">Ready</option><option value="dropped">Dropped</option></select></label>
+      <label class="row"><input type="checkbox" id="dApproval"> Require my approval</label>
       <button id="dRetry" type="button" hidden>Retry</button>
       <button id="dDrop" type="button">Drop</button>
     </div>
@@ -199,6 +232,12 @@
   </div>
 </div>
 <div class="modal" id="lightbox" hidden><img id="lightImg" alt="Screenshot enlarged"></div>
+<div class="modal" id="approvalsModal" hidden>
+  <div class="mbox">
+    <div class="row btns"><strong>Approvals</strong><span class="sp"></span><button id="approvalsX" type="button">✕</button></div>
+    <div id="approvalsCards"></div>
+  </div>
+</div>
 <script src="office.js"></script>
 </body>
 </html>

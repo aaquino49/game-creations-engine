@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 from http import client as http_client
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -158,6 +159,8 @@ class OfficeServer:
         with server._lock:
             server._cache.update({"t": 0.0, "state": None})
             server._shots.update({"t": 0.0, "data": []})
+        with server._models_lock:
+            server._models.update({"t": time.time(), "data": []})
         with server._probe_lock:
             server._probe.update({"running": False, "results": {}})
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)

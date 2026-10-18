@@ -10,6 +10,7 @@ project/STATUS.md
 project/events.log
 project/STOP
 project/commands/
+project/approvals/
 __pycache__/
 
 # Builds

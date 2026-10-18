@@ -118,6 +118,8 @@ def _money(s: str) -> float | None:
 def parse_opencode_stats(text) -> dict:
     """Parse `opencode stats --models` box-drawing output.
 
+    NOTE: this copy is kept identical to template/orchestrator/orchestrator.py:parse_opencode_stats
+    (the orchestrator must stay a single file).
     Returns {"total": float|None, "models": {name: {messages, input_tokens,
     output_tokens, cost}}}. Garbage input gives {"total": None, "models": {}}.
     """
