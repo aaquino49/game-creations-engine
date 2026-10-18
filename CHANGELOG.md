@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.0 (2026-10-18)
+
+Positions are roles now, not models. Agents are `quarterback` / `qa_lead` / `coder_1..5`;
+the model under each is one swappable field, two positions may share a model as long as
+they share its `account`, and `roles` maps the appointed quarterback/QA (legacy
+`claude`/`codex` ids and owner tags still resolve). Fallback chains are documented as
+the priority order per position. The office shows a Subscriptions panel (one badge per
+usage-limit bucket, worst state first) and each agent's model; `probe_models.py` probes
+once per account. The office also collapses task and lane bubbles until hovered/tapped,
+click to pin.
+
 ## 1.0.0 (2026-10-18)
 
 First capture of the engine, taken from Grim Haven while its v2.0 overhaul was running.

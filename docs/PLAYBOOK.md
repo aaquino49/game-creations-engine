@@ -90,16 +90,18 @@ Lessons that aren't code:
 | Plan right now (e.g. after adding an owner request) | create `project/PLAN_NOW`; a background plan starts within ~30 s even if every lane is busy |
 | Watch | `project/STATUS.md` (lanes, planner, milestones, PM notes), `project/events.log`, ntfy topic in config |
 | Steer | add a line under **Open** in `project/OWNER_REQUESTS.md` |
-| Change models | edit `coders` / `fallback` in `orchestrator/config.json`, commit, `project/RESTART` |
+| Change models | edit the position's `model` (and matching `-m` in its `cmd`) in `orchestrator/config.json`, commit, `project/RESTART`; reorder `coders` / `fallback` for priority |
 | Never | edit `project/board.json` while the orchestrator runs |
 
 ## 6. Tuning knobs (config.json)
 
 | Key | Meaning | Grim Haven value |
 |---|---|---|
-| `coders` | agents that code; lane i starts with coders[i], retries alternate | `["muse_paid"]` (was free DeepSeek/Muse, then Codex Luna) |
-| `fallback` | `"agent:step"` → chain; steps: `*`, `plan`, `review`, `qa`, `work-code`, `work-asset`, `work-qa`, `work-design` | free models first, paid last |
-| `paid_agents` | kept behind free agents even when reordering for QA | `["muse_paid"]` |
+| `coders` | positions that code; lane i starts with coders[i], retries alternate | `["coder_1"]` (was free coder_5/coder pool, then coder_2) |
+| `fallback` | `"position:step"` → priority chain; steps: `*`, `plan`, `review`, `qa`, `work-code`, `work-asset`, `work-qa`, `work-design` | free models first, paid last |
+| `paid_agents` | kept behind free agents even when reordering for QA | `["coder_1"]` |
+| `roles` | appointed positions: quarterback (plans/reviews) and qa (QA/assets) | `{"quarterback": "quarterback", "qa": "qa_lead"}` |
+| `accounts` | usage-limit buckets; positions on one account share its limit (office shows each) | anthropic, openai, meta_api |
 | `lanes` | worktree lanes (dirs outside OneDrive) | B, C |
 | `background_planning` | plan in a thread | true |
 | `plan_every_n_done` | routine re-plan cadence | 6 |

@@ -53,10 +53,16 @@ def probe(name: str, agent: dict, cwd: str) -> tuple[str, str]:
 
 def main() -> int:
     agents = agents_from(sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parent.parent / "presets" / "default.json"))
-    with tempfile.TemporaryDirectory(prefix="gce_probe_") as tmp, cf.ThreadPoolExecutor(len(agents)) as pool:
-        results = list(pool.map(lambda kv: probe(kv[0], kv[1], tmp), agents.items()))
-    for name, verdict in sorted(results):
-        print(f"  {name:12} {verdict}")
+    by_account: dict = {}
+    for name, agent in agents.items():
+        by_account.setdefault(agent.get("account", name), []).append((name, agent))
+    firsts = [(acct, members[0][0], members[0][1], [m[0] for m in members]) for acct, members in by_account.items()]
+    with tempfile.TemporaryDirectory(prefix="gce_probe_") as tmp, cf.ThreadPoolExecutor(len(firsts)) as pool:
+        results = list(pool.map(lambda t: (t[0], t[3], t[1], probe(t[1], t[2], tmp)[1]), firsts))
+    for acct, members, name, verdict in sorted(results):
+        model = agents[name].get("model", "?")
+        shared = "" if members == [name] else f" (shared by {', '.join(members)})"
+        print(f"  {acct:12} {verdict:12} {name} [{model}]{shared}")
     return 0
 
 

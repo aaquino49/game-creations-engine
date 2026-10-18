@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Office</title>
+<link rel="stylesheet" href="office.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>☕</text></svg>">
+</head>
+<body>
+<header class="top">
+  <div class="title">
+    <span class="game" id="game">The Office</span>
+    <span class="sub" id="subtitle">the AI team, live</span>
+  </div>
+  <div class="pills">
+    <label id="demoControl" hidden>Preview
+      <select id="scene" aria-label="Preview scene">
+        <option value="auto">Auto tour</option>
+        <option value="working">At work</option>
+        <option value="checks">Tests &amp; merges</option>
+        <option value="idle">Coffee break</option>
+        <option value="limits">Usage limits</option>
+        <option value="complete">Project complete</option>
+        <option value="closed">Office closed</option>
+      </select>
+    </label>
+    <span class="pill" id="pill">connecting…</span>
+    <span class="counts" id="counts"></span>
+    <span class="clock" id="clock"></span>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="stage-wrap" id="stageWrap">
+    <div class="stage" id="stage">
+      <canvas id="office" width="320" height="176" role="img" aria-label="Animated pixel office. Worker activity is also listed in the Team panel."></canvas>
+      <div class="overlay" id="overlay"></div>
+      <div class="banner" id="banner" role="status" hidden></div>
+    </div>
+    <p class="hint" id="hint">Hover or tap a worker or lane plate for details; click to pin it. Closing this window never affects the team.</p>
+  </section>
+
+  <aside class="side">
+    <section class="panel">
+      <h2>Milestones</h2>
+      <ol class="milestones" id="milestones"></ol>
+    </section>
+    <section class="panel">
+      <h2>Team</h2>
+      <ul class="team" id="team"></ul>
+    </section>
+    <section class="panel">
+      <h2>Subscriptions</h2>
+      <ul class="subs" id="subs"></ul>
+    </section>
+    <section class="panel">
+      <h2>What just happened</h2>
+      <ul class="ticker" id="ticker"></ul>
+    </section>
+  </aside>
+</main>
+
+<script src="office.js"></script>
+</body>
+</html>

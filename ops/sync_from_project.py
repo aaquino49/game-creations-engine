@@ -83,8 +83,10 @@ def genericize(rel: str, text: str, ident: dict) -> str:
         text = text.replace(a, b)
 
     if rel == "orchestrator/orchestrator.py":
-        text = replace_block(text, "AGENT_NAMES = {", '''# Agent labels and accounts come from config.json ("label", "account" per agent). Agents sharing an account
-# (e.g. Codex QA and a Codex coder on one OpenAI plan) share its usage limit.
+        text = replace_block(text, "AGENT_NAMES = {", '''# Agent labels, models and accounts come from config.json ("label", "model", "account" per agent).
+# Positions are roles (quarterback, qa_lead, coder_1...); the model under each is swappable.
+# ROLES maps the two appointed positions to agent ids (legacy default: claude/codex).
+# Agents sharing an account (e.g. QA lead and coder_2 on one OpenAI plan) share its usage limit.
 AGENT_NAMES = {name: a.get("label", name) for name, a in CONFIG["agents"].items()}''')
         text = re.sub(r'CODER_OWNERS = \{[^}]*\}',
                       'CODER_OWNERS = {"coder", *CONFIG.get("coders", []), *CONFIG.get("coders_alt", [])}', text, count=1)

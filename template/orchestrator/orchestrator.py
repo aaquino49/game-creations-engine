@@ -125,9 +125,22 @@ TASK_FIELDS = ["title", "description", "acceptance", "priority", "depends_on", "
                "skip_qa"]
 ROLE_FOR_TYPE = {"code": "project/roles/coder.md", "asset": "project/roles/qa_assets.md",
                  "qa": "project/roles/qa_assets.md", "design": "project/roles/quarterback.md"}
-# Agent labels and accounts come from config.json ("label", "account" per agent). Agents sharing an account
-# (e.g. Codex QA and a Codex coder on one OpenAI plan) share its usage limit.
+# Agent labels, models and accounts come from config.json ("label", "model", "account" per agent).
+# Positions are roles (quarterback, qa_lead, coder_1...); the model under each is swappable.
+# ROLES maps the two appointed positions to agent ids (legacy default: claude/codex).
+# Agents sharing an account (e.g. QA lead and coder_2 on one OpenAI plan) share its usage limit.
 AGENT_NAMES = {name: a.get("label", name) for name, a in CONFIG["agents"].items()}
+ROLES = CONFIG.get("roles", {})
+QB = ROLES.get("quarterback", "quarterback" if "quarterback" in CONFIG["agents"] else "claude")
+QA = ROLES.get("qa", "qa_lead" if "qa_lead" in CONFIG["agents"] else "codex")
+
+
+def resolve_owner(owner: str) -> str:
+    """Board owner tags are positions, not agents: legacy tags name the old agent ids, so map
+    them onto the appointed agents (a no-op when the tag already names a configured agent)."""
+    if owner in CONFIG["agents"]:
+        return owner
+    return {"claude": QB, "codex": QA}.get(owner, owner)
 # Code tasks are owned by "coder": each lane starts with its own free model and attempts alternate between them,
 # so a task one model keeps failing gets a fresh pair of eyes. An explicit owner naming one of the coders starts with it.
 CODER_OWNERS = {"coder", *CONFIG.get("coders", []), *CONFIG.get("coders_alt", [])}
@@ -138,7 +151,7 @@ def coders() -> list[str]:
 
 
 def resolve_worker(task: dict, lane: str, attempt: int) -> str:
-    owner = task["owner"]
+    owner = resolve_owner(task["owner"])
     if owner not in CODER_OWNERS:
         return owner
     pool = coders()
@@ -472,7 +485,7 @@ def _add_task(board: dict, spec: dict, source: str) -> dict | None:
         "attempts": 0, "history": [], "source": source,
     }
     if task["owner"] not in CONFIG["agents"] and task["owner"] not in CODER_OWNERS:
-        task["owner"] = "coder" if task["type"] == "code" else "codex" if task["type"] in ("asset", "qa") else "claude"
+        task["owner"] = "coder" if task["type"] == "code" else resolve_owner("codex") if task["type"] in ("asset", "qa") else resolve_owner("claude")
     board["tasks"].append(task)
     event(f"NEW TASK {tid} ({task['owner']}, {task['milestone']}) from {source}: {task['title']}")
     return task
@@ -664,7 +677,7 @@ def preemptive_handoff() -> None:
     """Hand OpenAI work to the fallbacks *before* the limit hits, using Codex's own usage numbers."""
     th = CONFIG.get("handoff_at_percent") or {}
     rl = codex_usage()
-    if not rl or limited_until("codex"):
+    if not rl or limited_until(QA):
         return
     for key in ("primary", "secondary"):
         w = rl.get(key) or {}
@@ -674,10 +687,11 @@ def preemptive_handoff() -> None:
         if float(used) >= float(limit_pct):
             until = dt.datetime.fromtimestamp(int(resets))
             if until > dt.datetime.now():
-                _state.setdefault("limited_until", {})["openai"] = until
-                _state.setdefault("preemptive", set()).add("openai")
+                _acct = ACCOUNT.get(QA, QA)
+                _state.setdefault("limited_until", {})[_acct] = until
+                _state.setdefault("preemptive", set()).add(_acct)
                 window = "5-hour" if key == "primary" else "weekly"
-                event(f"PREEMPTIVE HANDOFF openai at {used:.0f}% of its {window} window (threshold {limit_pct}%); "
+                event(f"PREEMPTIVE HANDOFF {_acct} at {used:.0f}% of its {window} window (threshold {limit_pct}%); "
                       f"routing its work to fallbacks until {until:%a %H:%M}")
                 notify("openai-limit", "{{GAME_NAME}}: Codex limit almost reached",
                        f"OpenAI is at {used:.0f}% of its {window} limit. Backups are covering until {until:%a %b %d %H:%M}. "
@@ -796,7 +810,7 @@ def call_agent(agent: str, prompt_file: Path, out_file: Path, log_name: str, boa
             until = dt.datetime.now() + dt.timedelta(minutes=MODEL_GONE_MINUTES)
             _state.setdefault("limited_until", {})[ACCOUNT.get(use, use)] = until
             event(f"MODEL GONE {use}: the provider no longer serves this model id; parked until ~{until:%a %H:%M} "
-                  f"(owner: update its -m in config.json). Evidence: {log_path.name}")
+                  f"(owner: update its model in orchestrator/config.json). Evidence: {log_path.name}")
             notify("model-gone-" + use, f"{{GAME_NAME}}: {use} model id not found",
                    f"OpenCode says the model for '{use}' no longer exists. It is parked for 12h; fallbacks cover. "
                    f"Update orchestrator/config.json if you want it back.", email=True)
@@ -976,7 +990,7 @@ Write the plan JSON (format: PROTOCOL.md "Plan") to: `{rel(d / 'plan.json')}`
 """
     pf = write_prompt(d / "prompt_plan.md", text)
     event(f"PLAN start ({reason}){' [background]' if cur_lane() == 'P' else ''}")
-    plan = call_agent("claude", pf, d / "plan.json", "plan", board, step_kind="plan")
+    plan = call_agent(QB, pf, d / "plan.json", "plan", board, step_kind="plan")
     if plan is None:
         event("PLAN failed (no plan.json)")
         return None
@@ -1327,7 +1341,7 @@ def run_task(board: dict, task: dict, lane: str = "A") -> str:
         qa = None
         if task["type"] == "code" and work.get("status") == "done" and checks["passed"] and not skips_qa(task):
             imgs = [ROOT / checks["screenshot"]] if checks.get("screenshot") else []
-            qa = call_agent("codex", qa_prompt(task, d, checkpoint, work, checks), d / "qa.json", "qa", board, imgs,
+            qa = call_agent(QA, qa_prompt(task, d, checkpoint, work, checks), d / "qa.json", "qa", board, imgs,
                             step_kind="qa", avoid=agent)
             if qa:
                 hist["qa"] = qa.get("verdict")
@@ -1348,7 +1362,7 @@ def run_task(board: dict, task: dict, lane: str = "A") -> str:
             add_bugs(board, read_json(d / "bugs.json"), f"QA {tid}", task["milestone"])
 
         # REVIEW
-        review = call_agent("claude", review_prompt(task, d, checkpoint, work, checks, qa), d / "review.json",
+        review = call_agent(QB, review_prompt(task, d, checkpoint, work, checks, qa), d / "review.json",
                             "review", board, step_kind="review")
         if review is None:
             ok = checks["passed"] and work.get("status") == "done" and (qa is None or qa.get("verdict") == "pass")
@@ -1696,7 +1710,7 @@ def start_planner(board: dict, reason: str) -> bool:
 
 def can_start_now(task: dict) -> bool:
     """False when the task's owner is rate-limited and no fallback can cover its work step."""
-    owners = coders() if task["owner"] in CODER_OWNERS else [task["owner"]]
+    owners = coders() if task["owner"] in CODER_OWNERS else [resolve_owner(task["owner"])]
     for owner in owners:
         if not limited_until(owner) or any(not limited_until(f) for f in fallback_for(owner, f"work-{task['type']}")):
             return True

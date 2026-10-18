@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 """Create a new game project from the Game Creations Engine template.
 
-Example (the Grim Haven lineup):
+Example (the Grim Haven lineup, positions named by role so models can be swapped freely):
   python scaffold.py --target "C:/Users/me/Projects/My Game" --name "My Game" --pitch "A grim roguelite." \\
-    --agent claude=claude:claude-opus-5-5 \\
-    --agent codex=codex:gpt-6.1-sol \\
-    --agent codex_luna=codex:gpt-6-luna \\
-    --agent beam=opencode:opencode/beam-free \\
-    --agent deepseek=opencode:opencode/deepseek-v4.1-flash-free \\
-    --agent muse_paid=opencode:meta/muse-spark-1.3-contributor --paid muse_paid \\
-    --coders codex_luna \\
-    --fallback "codex_luna:*=beam,deepseek,muse_paid" --fallback "codex:qa=beam,deepseek,muse_paid" \\
-    --fallback "claude:*=codex,muse_paid" --lanes 3
+    --agent quarterback=claude:claude-opus-5-5 \\
+    --agent qa_lead=codex:gpt-6.1-sol \\
+    --agent coder_2=codex:gpt-6-luna \\
+    --agent coder_3=opencode:opencode/beam-free \\
+    --agent coder_5=opencode:opencode/deepseek-v4.1-flash-free \\
+    --agent coder_1=opencode:meta/muse-spark-1.3-contributor@meta_api --paid coder_1 \\
+    --role quarterback=quarterback --role qa=qa_lead \\
+    --coders coder_2 \\
+    --fallback "coder_2:*=coder_3,coder_5,coder_1" --fallback "qa_lead:qa=coder_3,coder_5,coder_1" \\
+    --fallback "quarterback:*=qa_lead,coder_1" --lanes 3
 
 Agent kinds:  claude:<model>   codex:<model>   opencode:<provider/model>   cmd:<json list with {prompt}>
-Required agent names: `claude` (quarterback: plans, reviews, design tasks) and `codex` (QA and assets).
-The agents' accounts: claude -> anthropic, codex -> openai (agents on one account share its usage limit),
-opencode models each get their own account (their free tiers are limited per model).
+Agent spec form:  name=kind:model[@account]   (e.g. coder_1=opencode:meta/muse-x@meta_api).
+A preset may also give an agent as a dict: {"kind", "model", "account"?, "label"?}.
+Positions are roles (quarterback, qa_lead, coder_1...): the model underneath is one
+swappable field, and two positions may share a model as long as they share its account.
+Required positions: a quarterback (plans, reviews, design tasks) and a QA lead (QA and
+assets) -- set them with --role quarterback=<agent> --role qa=<agent>.
+The fallback chains ("agent:step=a,b,c", ordered) are the priority order per position:
+when a subscription runs out, work moves down the chain until its reset time.
+Accounts are usage-limit buckets: claude -> anthropic, codex -> openai (positions on one
+account share its limit); opencode/cmd positions each get their own account unless you
+pass @account or set one in the preset, so shared models share the limit.
 """
 from __future__ import annotations
 
@@ -35,24 +44,48 @@ DEFAULT_PRESET = ENGINE / "presets" / "default.json"
 TEXT_EXT = {".py", ".md", ".gd", ".tscn", ".godot", ".cfg", ".json", ".bat", ".txt", ".gitignore", ".gitattributes"}
 
 
-def agent_spec(name: str, spec: str) -> dict:
-    kind, _, arg = spec.partition(":")
+def agent_spec(name: str, spec: str | dict) -> dict:
+    """An agent is a position (role) with a swappable model underneath: {cmd, kind, model, account, label}.
+
+    String form: "kind:model[@account]". Dict form (presets): {"kind", "model", "account"?, "label"?}.
+    Two positions may share one model -- give them the same account so they share its usage limit.
+    """
+    if isinstance(spec, dict):
+        kind, arg = spec["kind"], spec["model"]
+        account = spec.get("account")
+        label = spec.get("label")
+    else:
+        account = None
+        if "@" in spec:
+            spec, _, account = spec.rpartition("@")
+            account = account.strip() or None
+        kind, _, arg = spec.partition(":")
+        label = None
     if kind == "claude":
-        return {"cmd": ["claude", "-p", "{prompt}", "--model", arg, "--dangerously-skip-permissions"],
-                "account": "anthropic", "label": f"Claude {arg}"}
-    if kind == "codex":
-        return {"cmd": ["codex", "exec", "-m", arg, "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
-                        "{prompt}", "{images}"], "account": "openai", "label": f"Codex {arg}"}
-    if kind == "opencode":
+        out = {"cmd": ["claude", "-p", "{prompt}", "--model", arg, "--dangerously-skip-permissions"],
+               "account": "anthropic", "label": f"Claude {arg}"}
+    elif kind == "codex":
+        out = {"cmd": ["codex", "exec", "-m", arg, "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
+                       "{prompt}", "{images}"], "account": "openai", "label": f"Codex {arg}"}
+    elif kind == "opencode":
         # --print-logs/--log-level ERROR make OpenCode print rate-limit errors, which it otherwise retries silently
         # forever; watch_rate_limit lets the orchestrator kill the run on the first one and fall back.
-        return {"cmd": ["opencode", "run", "--auto", "--print-logs", "--log-level", "ERROR", "-m", arg, "{prompt}"],
-                "account": name, "label": f"{arg} via OpenCode", "watch_rate_limit": True}
-    if kind == "cmd":
+        out = {"cmd": ["opencode", "run", "--auto", "--print-logs", "--log-level", "ERROR", "-m", arg, "{prompt}"],
+               "account": name, "label": f"{arg} via OpenCode", "watch_rate_limit": True}
+    elif kind == "cmd":
         cmd = json.loads(arg)
         assert "{prompt}" in cmd, "cmd agents need a {prompt} placeholder"
-        return {"cmd": cmd, "account": name, "label": name}
-    raise SystemExit(f"unknown agent kind in {name}={spec}")
+        out = {"cmd": cmd, "account": name, "label": name}
+    else:
+        raise SystemExit(f"unknown agent kind in {name}={spec}")
+    out["kind"] = kind
+    out["model"] = arg if kind != "cmd" else ""
+    if account:
+        out["account"] = account
+    label = label or re.sub(r"\b(Qa|Ai|Api)\b", lambda m: {"Qa": "QA", "Ai": "AI", "Api": "API"}[m.group(1)],
+                            name.replace("_", " ").title())
+    out["label"] = label
+    return out
 
 
 def load_preset(a: argparse.Namespace) -> dict:
@@ -71,11 +104,23 @@ def build_config(a: argparse.Namespace, slug: str, topic: str) -> dict:
     for item in a.agent or []:
         name, _, spec = item.partition("=")
         agents[name.strip()] = agent_spec(name.strip(), spec.strip())
-    agents.setdefault("claude", agent_spec("claude", "claude:claude-opus-5-5"))
-    agents.setdefault("codex", agent_spec("codex", "codex:gpt-6.1-sol"))
     a.paid = list(dict.fromkeys((preset.get("paid") or []) + (a.paid or [])))
     for p in a.paid:
-        agents[p]["label"] += " (paid)"
+        if p in agents and "(paid)" not in agents[p]["label"]:
+            agents[p]["label"] += " (paid)"
+    roles = dict(preset.get("roles") or {})
+    for item in a.role or []:
+        role, _, agent = item.partition("=")
+        roles[role.strip()] = agent.strip()
+    roles.setdefault("quarterback", "quarterback" if "quarterback" in agents else "claude")
+    roles.setdefault("qa", "qa_lead" if "qa_lead" in agents else "codex")
+    for r, agent in roles.items():
+        if agent not in agents:
+            raise SystemExit(f"role '{r}' points at unknown agent '{agent}' (add --agent {agent}=...)")
+    if "quarterback" not in agents and "claude" not in agents:
+        agents["claude"] = agent_spec("claude", "claude:claude-opus-5-5")
+    if "qa_lead" not in agents and "codex" not in agents:
+        agents["codex"] = agent_spec("codex", "codex:gpt-6.1-sol")
     fallback = {k: list(v) for k, v in (preset.get("fallback") or {}).items()}
     for item in a.fallback or []:
         key, _, chain = item.partition("=")
@@ -91,7 +136,8 @@ def build_config(a: argparse.Namespace, slug: str, topic: str) -> dict:
              for i in range(max(0, a.lanes - 1))]
     return {
         "max_attempts": 3, "plan_every_n_done": 6, "agent_timeout_minutes": 60, "stuck_retry_minutes": 60,
-        "godot": a.godot, "coders": coders, "agents": agents, "fallback": fallback, "paid_agents": a.paid or [],
+        "godot": a.godot, "coders": coders, "agents": agents, "roles": roles, "fallback": fallback,
+        "paid_agents": a.paid or [], "accounts": preset.get("accounts") or {},
         "lanes": lanes, "lane_b": {"merge_wait_minutes": 120}, "background_planning": True,
         "stop_on_usage_limit": False, "expansion_after_v1": not a.no_expansion, "default_limit_minutes": 60,
         "probe_every_minutes": 15, "godot_watchdog_minutes": 10,
@@ -99,20 +145,21 @@ def build_config(a: argparse.Namespace, slug: str, topic: str) -> dict:
         "abort_after_matches": 1,
         "handoff_at_percent": {"primary": 97, "secondary": 98},
         "supervisor": {"stall_minutes": 40, "lane_idle_minutes": 20, "cooldown_minutes": 45,
-                       "agents": ["claude", "codex", *(a.paid or [])], "timeout_minutes": 30},  # paid last: both subscriptions can be limited at once
+                       "agents": [roles["quarterback"], roles["qa"], *(a.paid or [])], "timeout_minutes": 30},  # paid last: both subscriptions can be limited at once
         "notify": {"ntfy_topic": topic, "email": "", "min_minutes_between": 60},
         "_notes": "Generated by the Game Creations Engine (scripts/scaffold.py). Change coders/fallback here, commit, then create project/RESTART.",
     }
 
 
 def team_table(cfg: dict) -> str:
+    qb, qa = cfg["roles"]["quarterback"], cfg["roles"]["qa"]
     rows = ["| Agent | Command | Role |", "|---|---|---|",
-            f"| **claude** | {cfg['agents']['claude']['label']} | Quarterback: product manager, project manager, tech "
+            f"| **{qb}** | {cfg['agents'][qb]['label']} ({cfg['agents'][qb]['model']}) | Quarterback: product manager, project manager, tech "
             f"lead, final reviewer. Owns the GDD, the backlog and all decisions. |",
-            f"| **codex** | {cfg['agents']['codex']['label']} | QA (tests, playtests, bug reports) and asset producer. |"]
+            f"| **{qa}** | {cfg['agents'][qa]['label']} ({cfg['agents'][qa]['model']}) | QA (tests, playtests, bug reports) and asset producer. |"]
     for i, c in enumerate(cfg["coders"]):
-        rows.append(f"| **{c}** | {cfg['agents'][c]['label']} | Coder{' (all lanes)' if len(cfg['coders']) == 1 else ''}. |")
-    others = sorted({x for ch in cfg["fallback"].values() for x in ch} - set(cfg["coders"]) - {"claude", "codex"})
+        rows.append(f"| **{c}** | {cfg['agents'][c]['label']} ({cfg['agents'][c]['model']}) | Coder{' (all lanes)' if len(cfg['coders']) == 1 else ''}. |")
+    others = sorted({x for ch in cfg["fallback"].values() for x in ch} - set(cfg["coders"]) - {qb, qa})
     for o in others:
         role = "Paid cover, only when every free/subscription option is rate-limited." if o in cfg["paid_agents"] \
             else "Fallback when the preferred agent is rate-limited."
@@ -129,7 +176,8 @@ def main() -> None:
     ap.add_argument("--pitch", required=True, help="one sentence")
     ap.add_argument("--exe", help="build name without .exe (default: name without spaces)")
     ap.add_argument("--slug", help="short id for worktree folders (default: initials)")
-    ap.add_argument("--agent", action="append", help="name=kind:arg (see module doc)")
+    ap.add_argument("--agent", action="append", help="name=kind:model[@account] (see module doc)")
+    ap.add_argument("--role", action="append", help="role=agent (roles: quarterback, qa)")
     ap.add_argument("--coders", help="comma list of agent names that code (one per lane, alternating on retries)")
     ap.add_argument("--fallback", action="append", help='"agent:step=a,b,c" (step: *, qa, plan, review, work-code, ...)')
     ap.add_argument("--paid", action="append", help="agent name that costs money (kept last in fallback chains)")
@@ -154,7 +202,7 @@ def main() -> None:
             "{{PITCH}}": a.pitch.replace('"', "'"), "{{NTFY_TOPIC}}": topic, "{{TEAM_TABLE}}": team_table(cfg)}
 
     for src in TEMPLATE.rglob("*"):
-        if src.is_dir():
+        if src.is_dir() or "__pycache__" in src.parts or src.suffix == ".pyc":
             continue
         dst = target / src.relative_to(TEMPLATE)
         dst.parent.mkdir(parents=True, exist_ok=True)

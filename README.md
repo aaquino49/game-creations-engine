@@ -128,25 +128,27 @@ More on supervising, including the check-in prompt: [docs/supervising.md](docs/s
 
 ## 6. Models, money and the default team
 
-[presets/default.json](presets/default.json) is the Grim Haven lineup as of 2026-10-18:
+[presets/default.json](presets/default.json) is the Grim Haven lineup as of 2026-10-18.
+Positions are roles; the model under each is one swappable field:
 
-| Agent | Model | Used for | Cost |
+| Position | Model | Used for | Cost |
 |---|---|---|---|
-| `claude` | Claude Opus 5.5 | plan, review, design | your Claude plan |
-| `codex` | GPT-6.1-Sol | QA, all art | your ChatGPT plan |
-| `codex_luna` | GPT-6-Luna | first coding fallback | same ChatGPT plan (shares its limit) |
-| `muse_paid` | Muse Spark 1.3 Contributor (OpenCode) | coding, all lanes | **pay per use** |
-| `beam`, `longcat`, `deepseek` | free OpenCode models | coding fallbacks | free, often rate-limited |
+| `quarterback` | Claude Opus 5.5 | plan, review, design | your Claude plan |
+| `qa_lead` | GPT-6.1-Sol | QA, all art | your ChatGPT plan |
+| `coder_2` | GPT-6-Luna | first coding fallback | same ChatGPT plan (shares its limit) |
+| `coder_1` | Muse Spark 1.3 Contributor (OpenCode) | coding, all lanes | **pay per use** |
+| `coder_3`, `coder_4`, `coder_5` | free OpenCode models | coding fallbacks | free, often rate-limited |
 
 Rules baked into the preset (each one learned the hard way):
 
-- **Art has no fallback** (`"codex:work-asset": []`). Models without image generation will "paint" portraits with code and they look terrible. Art tasks wait for Codex instead.
-- **Paid agents go last** in every chain (`paid_agents`), except where you deliberately make one a coder.
+- **Art has no fallback** (`"qa_lead:work-asset": []`). Models without image generation will "paint" portraits with code and they look terrible. Art tasks wait for the QA lead instead.
+- **Paid positions go last** in every chain (`paid_agents`), except where you deliberately make one a coder.
 - **QA avoids the model that wrote the code.**
-- **Shared accounts share limits.** `codex` and `codex_luna` both draw on one OpenAI plan; the orchestrator hands work off early at 97% / 98% usage.
+- **Shared accounts share limits.** `qa_lead` and `coder_2` both draw on one OpenAI plan; the orchestrator hands work off early at 97% / 98% usage. The office sidebar shows every subscription's state.
 - **Free models are unreliable.** Benchmark them before relying on them (`python scripts/benchmark_models.py`), and never make one the only option for a role.
+- **Priority order = fallback chains.** Each `"position:step"` list in `fallback` is tried in order when a subscription runs out (e.g. quarterback falls back to `qa_lead`, then `coder_1`). Edit them in `orchestrator/config.json`, commit, create `project/RESTART`.
 
-To make your own lineup, copy `presets/default.json` to `presets/<name>.json`, edit it, and scaffold with `--preset presets/<name>.json`. Agent specs are `claude:<model>`, `codex:<model>`, `opencode:<provider/model>` or `cmd:<JSON argv with {prompt}>`. Model ids change; check `opencode models` and `ops/probe_models.py` before a new game.
+To make your own lineup, copy `presets/default.json` to `presets/<name>.json`, edit it, and scaffold with `--preset presets/<name>.json`. Agent specs are `claude:<model>`, `codex:<model>`, `opencode:<provider/model>` or `cmd:<JSON argv with {prompt}>`, each optionally `@account`, or a `{"kind", "model", "account"?, "label"?}` dict. Model ids change; check `opencode models` and `ops/probe_models.py` before a new game. To swap a model, edit its position's `model` (and `cmd` follows automatically on next scaffold — for a running project, edit both `model` and the `-m` in `cmd`).
 
 ## 7. Troubleshooting
 

@@ -5,7 +5,7 @@ title {{GAME_NAME}} - AI team orchestrator
 echo Starting the {{GAME_NAME}} AI team. Live status: project\STATUS.md
 echo To stop: create an empty file project\STOP (stops after the current step) or close this window.
 :run
-python orchestrator\orchestrator.py %*
+python "%~dp0orchestrator\orchestrator.py" %*
 if errorlevel 75 if not errorlevel 76 (
   echo Reloading the orchestrator...
   goto run
