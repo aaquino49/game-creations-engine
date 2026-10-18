@@ -124,6 +124,8 @@ Then, in the new folder:
 
 **Never** edit `project/board.json` while the orchestrator runs, and never start a second orchestrator in the same project.
 
+**Manage mode (the Office).** `office.bat` is read-only. Double-click `office-manage.bat` (or `python office/server.py --manage`) for controls: the console prints a token URL like `http://localhost:8765/?token=...` — open that (the page keeps the token for the session). The header bar offers **Plan now** (plans within ~30 s), **Restart** (reloads orchestrator code between tasks), **Stop** (finishes the current step then stops; **Start** re-launches via `start.bat` when the team is offline), each pending flag shown as a chip you can cancel; the **Requests** panel sends a line to `project/OWNER_REQUESTS.md` for the next plan; the **Health** panel probes each model, sends a test phone notification, and can start the supervisor. Security: every write needs the token header and only `localhost` may call — `--lan` (phone on the same Wi-Fi) additionally allows the machine's LAN IP, which exposes the controls to your Wi-Fi, so keep the token URL private.
+
 More on supervising, including the check-in prompt: [docs/supervising.md](docs/supervising.md).
 
 ## 6. Models, money and the default team

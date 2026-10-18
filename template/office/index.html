@@ -29,6 +29,13 @@
     <span class="counts" id="counts"></span>
     <span class="clock" id="clock"></span>
   </div>
+  <div class="controlbar" id="controlbar" hidden>
+    <button id="btnPlan" type="button">Plan now</button>
+    <button id="btnRestart" type="button">Restart</button>
+    <button id="btnStop" type="button">Stop</button>
+    <button id="btnStart" type="button" hidden>Start</button>
+    <span class="chips" id="flagChips"></span>
+  </div>
 </header>
 
 <main class="layout">
@@ -58,9 +65,29 @@
       <h2>What just happened</h2>
       <ul class="ticker" id="ticker"></ul>
     </section>
+    <section class="panel" id="requestsPanel" hidden>
+      <h2>Requests</h2>
+      <textarea id="reqText" rows="3" maxlength="2000" placeholder="Ask the team for something…"></textarea>
+      <label class="row"><input type="checkbox" id="reqPlan"> Plan now too</label>
+      <button id="btnSend" type="button">Send to the team</button>
+      <h3>Open</h3>
+      <ul class="reqlist" id="reqOpen"></ul>
+      <h3>Handled</h3>
+      <ul class="reqlist" id="reqHandled"></ul>
+    </section>
+    <section class="panel" id="healthPanel" hidden>
+      <h2>Health</h2>
+      <div class="row btns">
+        <button id="btnProbe" type="button">Probe models</button>
+        <button id="btnNotify" type="button">Test notification</button>
+        <button id="btnSup" type="button" hidden>Start supervisor</button>
+      </div>
+      <ul class="probelist" id="probeRows"></ul>
+    </section>
   </aside>
 </main>
 
+<div class="toast" id="toast" role="status" hidden></div>
 <script src="office.js"></script>
 </body>
 </html>

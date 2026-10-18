@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.0 (unreleased)
+
+The Office grows a manage mode (`office-manage.bat` / `office/server.py --manage`): token-URL auth
+plus a localhost-only host check, a header control bar (Plan now, Restart, Stop, Start, cancellable
+flag chips), a Requests panel writing to `project/OWNER_REQUESTS.md`, and a Health panel (model
+probes grouped by account, test phone notification, supervisor start). Without `--manage` the
+server is read-only exactly as before; `--demo` shows the new UI but rejects every write.
+
 ## 1.1.0 (2026-10-18)
 
 Positions are roles now, not models. Agents are `quarterback` / `qa_lead` / `coder_1..5`;

@@ -732,6 +732,7 @@ function renderSide(st) {
   }));
   if (!evs.length) emptyItem(tk, "Waiting for the team's first event.");
   if (st.events.length) tickerSeen = Math.max(...st.events.map(e => e.id));
+  renderManage(st);
 }
 
 function emptyItem(list, text) {
@@ -776,7 +777,7 @@ async function poll() {
   polling = true;
   try {
     const scene = document.getElementById("scene").value;
-    const r = await fetch("api/state?scene=" + encodeURIComponent(scene), { cache: "no-store", signal: AbortSignal.timeout(6000) });
+    const r = await api("api/state?scene=" + encodeURIComponent(scene), { cache: "no-store", signal: AbortSignal.timeout(6000) });
     if (!r.ok) throw new Error(`Office returned ${r.status}`);
     const st = await r.json();
     if (!st || !Array.isArray(st.lanes) || st.error) throw new Error("Project state unavailable");
@@ -801,3 +802,153 @@ loaded.then(() => { poll(); requestAnimationFrame(frame); }).catch(error => {
   document.getElementById("pill").textContent = "art could not load";
   bannerEl.hidden = false; bannerEl.textContent = error.message + ". Refresh to retry.";
 });
+
+// ------------------------------------------------------------------ manage mode (controls, requests, health)
+
+let OFFICE_TOKEN = new URLSearchParams(location.search).get("token") || "";
+try {
+  if (OFFICE_TOKEN) sessionStorage.setItem("officeToken", OFFICE_TOKEN);
+  else OFFICE_TOKEN = sessionStorage.getItem("officeToken") || "";
+  if (new URLSearchParams(location.search).get("token")) history.replaceState(null, "", location.pathname);
+} catch (e) { /* storage unavailable: the token lives only in memory */ }
+
+function api(path, opts = {}) {
+  const headers = { ...(opts.headers || {}), "X-Office-Token": OFFICE_TOKEN };
+  return fetch(path, { ...opts, headers });
+}
+
+let toastTimer = 0;
+function toast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.hidden = true; }, 4000);
+}
+
+function pollSoon() { clearTimeout(pollTimer); pollTimer = setTimeout(poll, 800); }
+
+async function runAction(btn, path, body, confirmMsg) {
+  if (confirmMsg && !confirm(confirmMsg)) return;
+  btn.disabled = true;
+  try {
+    const r = await api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    let d = {};
+    try { d = await r.json(); } catch (e) { /* plain-text error */ }
+    toast(r.ok ? "Done" : (d.error || "Error " + r.status));
+    if (r.ok) pollSoon();
+  } catch (e) { toast("Office server offline"); }
+  finally { btn.disabled = false; }
+}
+
+function fillReqList(ul, items, withChips) {
+  ul.replaceChildren(...items.map(text => {
+    const li = document.createElement("li");
+    li.append(document.createTextNode(text));
+    if (withChips) for (const tid of text.match(/T-\d+/g) || []) {
+      const b = document.createElement("span"); b.className = "chip"; b.textContent = tid; li.append(" ", b);
+    }
+    li.title = text;
+    return li;
+  }));
+  if (!items.length) emptyItem(ul, "Nothing here.");
+}
+
+async function refreshRequests() {
+  try {
+    const r = await api("api/requests", { cache: "no-store" });
+    if (!r.ok) return;
+    const d = await r.json();
+    fillReqList(document.getElementById("reqOpen"), d.open || [], false);
+    fillReqList(document.getElementById("reqHandled"), d.handled || [], true);
+  } catch (e) { /* the next refresh will retry */ }
+}
+
+let probeTimer = 0;
+async function refreshProbe() {
+  clearTimeout(probeTimer);
+  let running = false;
+  try {
+    const r = await api("api/probe", { cache: "no-store" });
+    if (r.ok) {
+      const d = await r.json();
+      running = !!d.running;
+      const ul = document.getElementById("probeRows");
+      const agents = (STATE && STATE.agents) || [];
+      const rows = Object.entries(d.results || {});
+      ul.replaceChildren(...rows.map(([id, res]) => {
+        const a = agents.find(x => x.id === id) || {};
+        const li = document.createElement("li");
+        li.className = "probe " + res.state;
+        const nm = document.createElement("span"); nm.className = "pname"; nm.textContent = shortName(id) + (a.model ? " · " + a.model : "");
+        const st = document.createElement("span"); st.className = "pbadge"; st.textContent = res.state;
+        const s = document.createElement("span"); s.className = "psecs"; s.textContent = (res.seconds || 0) + "s";
+        li.append(nm, st, s);
+        li.title = (res.detail || "").slice(-200) || res.state;
+        return li;
+      }));
+      if (!rows.length) emptyItem(ul, "No probe results yet. Press Probe models.");
+    }
+  } catch (e) { /* the next refresh will retry */ }
+  if (running) probeTimer = setTimeout(refreshProbe, 2000);
+}
+
+function renderManage(st) {
+  const on = !!st.manage;
+  document.getElementById("controlbar").hidden = !on;
+  document.getElementById("requestsPanel").hidden = !on;
+  document.getElementById("healthPanel").hidden = !on;
+  if (!on) return;
+  document.getElementById("btnStart").hidden = st.orchestrator !== false;
+  document.getElementById("btnSup").hidden = st.supervisor !== false;
+  const names = { STOP: "STOP pending", RESTART: "RESTART pending", PLAN_NOW: "PLAN pending" };
+  document.getElementById("flagChips").replaceChildren(...(st.flags || []).map(f => {
+    const c = document.createElement("span"); c.className = "chip flag";
+    c.append(document.createTextNode(names[f] || f + " pending"));
+    const x = document.createElement("button");
+    x.type = "button"; x.textContent = "✕"; x.setAttribute("aria-label", "Cancel " + f);
+    x.addEventListener("click", () => runAction(x, "api/control", { action: "cancel", flag: f }));
+    c.append(" ", x);
+    return c;
+  }));
+  const t = Date.now(); // the requests list refreshes at most every 10 s
+  if (!renderManage._lastReq || t - renderManage._lastReq > 10000) { renderManage._lastReq = t; refreshRequests(); }
+}
+
+function wireManage() {
+  const $ = id => document.getElementById(id);
+  $("btnPlan").addEventListener("click", e => runAction(e.target, "api/control", { action: "plan_now" }));
+  $("btnRestart").addEventListener("click", e => runAction(e.target, "api/control", { action: "restart" }, "Restart the orchestrator between tasks?"));
+  $("btnStop").addEventListener("click", e => runAction(e.target, "api/control", { action: "stop" }, "Stop the team after the current step?"));
+  $("btnStart").addEventListener("click", e => runAction(e.target, "api/control", { action: "start" }));
+  $("btnSup").addEventListener("click", e => runAction(e.target, "api/control", { action: "start_supervisor" }));
+  $("btnSend").addEventListener("click", e => {
+    const btn = e.target, ta = $("reqText");
+    btn.disabled = true;
+    api("api/requests", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: ta.value, plan_now: $("reqPlan").checked }) })
+      .then(async r => {
+        let d = {};
+        try { d = await r.json(); } catch (x) { /* plain-text error */ }
+        toast(r.ok ? "Sent to the team" : (d.error || "Error " + r.status));
+        if (r.ok) { ta.value = ""; refreshRequests(); pollSoon(); }
+      })
+      .catch(() => toast("Office server offline"))
+      .finally(() => { btn.disabled = false; });
+  });
+  $("btnProbe").addEventListener("click", e => {
+    const btn = e.target;
+    btn.disabled = true;
+    api("api/probe", { method: "POST" })
+      .then(async r => {
+        let d = {};
+        try { d = await r.json(); } catch (x) { /* plain-text error */ }
+        toast(r.ok ? "Probing models…" : (d.error || "Error " + r.status));
+        if (r.ok) refreshProbe();
+      })
+      .catch(() => toast("Office server offline"))
+      .finally(() => { btn.disabled = false; });
+  });
+  $("btnNotify").addEventListener("click", e => runAction(e.target, "api/notify-test", {}));
+}
+wireManage();

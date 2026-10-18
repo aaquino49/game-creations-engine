@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Office: a cute, optional, read-only window onto the AI team.
+"""The Office: a cute, optional window onto the AI team.
 
   office.bat                          (or: python office/server.py)
   python office/server.py --lan       also reachable from your phone on the same Wi-Fi
@@ -7,20 +7,29 @@
 
 Serves a small web page that shows every agent as a little person: at a desk when working (with what they're on),
 at the coffee machine or on the couch when idle, asleep when rate-limited, plus a progress bar per milestone.
-It only READS project files (STATUS.md, events.log, board.json, config.json, runs/); it never writes to the project,
-so opening or closing it has no effect on the team. Standard library only.
+With no flag it only READS project files (STATUS.md, events.log, board.json, config.json, runs/); opening or
+closing it has no effect on the team. With --manage it also accepts writes (controls, owner requests, health
+tools); every write needs the X-Office-Token printed at startup, and only localhost (or the LAN IP with --lan)
+may call. Standard library only.
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hmac
 import json
 import mimetypes
+import os
 import re
+import secrets
+import shlex
+import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,6 +41,13 @@ _procs = {"orchestrator": None, "supervisor": None, "checked": 0.0}
 _cache: dict = {"t": 0.0, "state": None}
 _lock = threading.Lock()
 DEMO = False
+MANAGE = False  # --manage enables every write feature; without it the server never writes
+TOKEN = ""  # manage-mode token, generated at startup (or --token)
+LAN_IP = ""  # set at startup when --lan is passed
+MAX_BODY = 64 * 1024
+_write_lock = threading.Lock()  # serialises read-modify-write of project files
+_probe = {"running": False, "results": {}}
+_probe_lock = threading.Lock()
 
 
 def process_status(commands: list[str], script: str) -> bool | None:
@@ -61,6 +77,172 @@ def read_json(p: Path):
         return json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+
+
+# ----------------------------------------------------------------------------- manage mode (writes; --manage only)
+
+def invalidate() -> None:
+    """Drop the 2-second state cache so the next poll shows a write."""
+    with _lock:
+        _cache["t"] = 0.0
+
+
+def atomic_write(p: Path, text: str) -> None:
+    """Write a text file atomically: tmp beside it, then os.replace."""
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def flags_now() -> list:
+    p = ROOT / "project"
+    return [f for f in ("STOP", "RESTART", "PLAN_NOW") if (p / f).exists()]
+
+
+def office_event(msg: str) -> None:
+    with (ROOT / "project" / "events.log").open("a", encoding="utf-8") as f:
+        f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+
+
+def host_allowed(host: str) -> bool:
+    """DNS-rebinding guard: only localhost (or the LAN IP with --lan) may use the API in manage mode."""
+    name = (host or "").strip().lower()
+    if name.startswith("["):  # IPv6 literal [::1]:port
+        name = name.split("]")[0] + "]"
+    elif name.count(":") == 1 and name.rsplit(":", 1)[1].isdigit():
+        name = name.rsplit(":", 1)[0]
+    ok = {"localhost", "127.0.0.1", "::1"}
+    if LAN_IP:
+        ok.add(LAN_IP.lower())
+    return name in ok
+
+
+def token_ok(given: str | None) -> bool:
+    return bool(given) and bool(TOKEN) and hmac.compare_digest(given, TOKEN)
+
+
+def parse_requests(text: str) -> dict:
+    """OWNER_REQUESTS.md -> {"open": [...], "handled": [...]}. Items are bullets or plain
+    paragraphs under ## Open / ## Handled; (none...) placeholders are skipped."""
+    open_items: list = []
+    handled_items: list = []
+    cur: str | None = None
+    para: list = []
+
+    def is_none(s: str) -> bool:
+        return s.strip().lower().startswith("(none")
+
+    def flush() -> None:
+        if para:
+            item = " ".join(para).strip()
+            if item and not is_none(item):
+                (open_items if cur == "open" else handled_items).append(item)
+            para.clear()
+
+    for line in text.splitlines():
+        m = re.match(r"^##\s+(\S.*?)\s*$", line)
+        if m:
+            flush()
+            head = m.group(1).lower()
+            cur = "open" if head == "open" else "handled" if head == "handled" else None
+            continue
+        if cur is None:
+            continue
+        if not line.strip():
+            flush()
+            continue
+        b = re.match(r"^\s*[-*]\s+(.*)$", line)
+        if b:
+            flush()
+            if b.group(1).strip() and not is_none(b.group(1)):
+                (open_items if cur == "open" else handled_items).append(b.group(1).strip())
+        else:
+            para.append(line.strip())
+    flush()
+    return {"open": open_items, "handled": handled_items}
+
+
+def insert_request(raw: str, entry: str) -> str:
+    """Insert an `- ...` entry line as the last item under ## Open, replacing a (none)
+    placeholder if there is one. Everything else stays byte-for-byte identical."""
+    if not re.search(r"^##\s+Open\s*$", raw, re.M):
+        if raw and not raw.endswith("\n"):
+            raw += "\n"
+        return (raw + "\n## Open\n\n" + entry + "\n") if raw else ("# Owner Requests\n\n## Open\n\n" + entry + "\n")
+    lines = raw.split("\n")
+    hi = next(i for i, l in enumerate(lines) if re.match(r"^##\s+Open\s*$", l))
+    end = next((i for i in range(hi + 1, len(lines)) if re.match(r"^##\s+", lines[i])), len(lines))
+    seg = lines[hi + 1:end]
+    for i, s in enumerate(seg):
+        if s.strip().lower().startswith("(none"):
+            seg[i] = entry
+            return "\n".join(lines[:hi + 1] + seg + lines[end:])
+    idx = len(seg)
+    while idx > 0 and not seg[idx - 1].strip():
+        idx -= 1
+    seg.insert(idx, entry)
+    return "\n".join(lines[:hi + 1] + seg + lines[end:])
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, timeout=10)
+        else:
+            proc.kill()
+    except Exception:  # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def run_probe_one(name: str, agent: dict) -> None:
+    """Run one agent's cmd with {prompt} replaced; record ok/fail/timeout into _probe."""
+    t0 = time.time()
+    state_, detail = "fail", ""
+    try:
+        cmd = agent.get("cmd") or []
+        prompt = "Reply with exactly: OK"
+        if isinstance(cmd, str):
+            argv = shlex.split(cmd.replace("{prompt}", prompt))
+        else:
+            argv = [c.replace("{prompt}", prompt) for c in cmd]
+        argv[0] = shutil.which(argv[0]) or argv[0]  # npm CLIs are .cmd shims that Popen can't find by bare name
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", NO_COLOR="1")
+        proc = subprocess.Popen(argv, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=env)
+        try:
+            out, _ = proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            out, _ = proc.communicate()
+            raise TimeoutError("probe timed out")
+        detail = (out or "")[-200:]
+        state_ = "ok" if proc.returncode == 0 and "OK" in (out or "") else "fail"
+    except TimeoutError:
+        state_ = "timeout"
+    except Exception as e:  # noqa: BLE001
+        detail = repr(e)[-200:]
+    with _probe_lock:
+        _probe["results"][name] = {"state": state_, "seconds": round(time.time() - t0, 2), "detail": detail}
+
+
+def run_probe_all(agents: dict) -> None:
+    """Agents sharing an account run one after another; different accounts run in parallel."""
+    groups: dict = {}
+    for n, a in agents.items():
+        groups.setdefault((a or {}).get("account", n), []).append(n)
+    threads = []
+    for names in groups.values():
+        t = threading.Thread(target=lambda ns=names: [run_probe_one(n, agents[n]) for n in ns], daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    with _probe_lock:
+        _probe["running"] = False
 
 
 def watch_processes() -> None:
@@ -352,7 +534,7 @@ def build_state() -> dict:
         "now": now_text, "lanes": [lanes[n] for n in lane_names], "planner": planner, "jobs": jobs,
         "agents": agent_list, "accounts": accounts, "milestones": order, "events": events, "supervisor_msg": last_sup[:200],
         "complete": bool(board.get("project_complete")),
-        "configured": bool(agents), "demo": False,
+        "configured": bool(agents), "demo": False, "manage": MANAGE,
         "counts": {s: sum(1 for t in board.get("tasks", []) if t["status"] == s)
                    for s in ("done", "in_progress", "ready", "backlog", "blocked")},
     }
@@ -383,6 +565,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def deny(self, code: int, msg: str) -> None:
+        self.send(code, json.dumps({"error": msg}).encode("utf-8"), "application/json")
+
+    def check_manage(self) -> bool:
+        """Host + manage-mode + token guard for writes and manage-only GETs. True if allowed."""
+        if MANAGE and not host_allowed(self.headers.get("Host", "")):
+            self.deny(403, "bad host")
+            return False
+        if not MANAGE:
+            self.deny(403, "manage mode off")
+            return False
+        if not token_ok(self.headers.get("X-Office-Token")):
+            self.deny(403, "bad token")
+            return False
+        return True
+
     def do_GET(self) -> None:  # noqa: N802
         url = urlsplit(self.path)
         path = unquote(url.path)
@@ -390,8 +588,24 @@ class Handler(BaseHTTPRequestHandler):
             if DEMO:
                 from demo import demo_state
                 scene = parse_qs(url.query).get("scene", ["auto"])[0]
-                return self.send(200, json.dumps(demo_state(scene)).encode("utf-8"), "application/json")
+                st = demo_state(scene)
+                st["manage"] = True  # the demo shows the manage UI off
+                return self.send(200, json.dumps(st).encode("utf-8"), "application/json")
+            if MANAGE and not host_allowed(self.headers.get("Host", "")):
+                return self.deny(403, "bad host")
             return self.send(200, json.dumps(state()).encode("utf-8"), "application/json")
+        if path in ("/api/requests", "/api/probe"):
+            if DEMO:
+                stub = {"open": [], "handled": []} if path == "/api/requests" else {"running": False, "results": {}}
+                return self.send(200, json.dumps(stub).encode("utf-8"), "application/json")
+            if not self.check_manage():
+                return
+            if path == "/api/requests":
+                return self.send(200, json.dumps(parse_requests(read(ROOT / "project" / "OWNER_REQUESTS.md"))).encode("utf-8"),
+                                 "application/json")
+            with _probe_lock:
+                snap = {"running": _probe["running"], "results": dict(_probe["results"])}
+            return self.send(200, json.dumps(snap).encode("utf-8"), "application/json")
         rel = "index.html" if path in ("/", "") else path.lstrip("/")
         f = (HERE / rel).resolve()
         if HERE not in f.parents or not f.is_file() or f.suffix not in {".html", ".css", ".js", ".png", ".woff2", ".txt"}:
@@ -401,25 +615,145 @@ class Handler(BaseHTTPRequestHandler):
             ctype = "font/woff2"
         self.send(200, f.read_bytes(), ctype)
 
+    def do_POST(self) -> None:  # noqa: N802
+        path = unquote(urlsplit(self.path).path)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length < 0:
+            return self.deny(400, "bad length")
+        if length > MAX_BODY:
+            return self.deny(413, "body too large")
+        if DEMO and path.startswith("/api/"):
+            return self.deny(409, "demo mode")
+        if not self.check_manage():
+            return
+        try:
+            data = json.loads(self.rfile.read(length) if length else b"{}")
+        except ValueError:
+            return self.deny(400, "bad json")
+        if not isinstance(data, dict):
+            return self.deny(400, "bad json")
+        if path == "/api/control":
+            return self.handle_control(data)
+        if path == "/api/requests":
+            return self.handle_request_post(data)
+        if path == "/api/probe":
+            return self.handle_probe_post()
+        if path == "/api/notify-test":
+            return self.handle_notify_post()
+        return self.deny(404, "unknown endpoint")
+
+    def handle_control(self, data: dict) -> None:
+        action = data.get("action", "")
+        if action in ("plan_now", "restart", "stop"):
+            name = {"plan_now": "PLAN_NOW", "restart": "RESTART", "stop": "STOP"}[action]
+            atomic_write(ROOT / "project" / name,
+                         f"requested from the Office at {dt.datetime.now().isoformat(timespec='seconds')}\n")
+            office_event(f"OFFICE {action} requested")
+        elif action == "cancel":
+            if data.get("flag", "") not in ("STOP", "RESTART", "PLAN_NOW"):
+                return self.deny(400, "unknown flag")
+            try:
+                (ROOT / "project" / data["flag"]).unlink()
+            except OSError:
+                pass
+        elif action == "start":
+            if _procs.get("orchestrator") is True:
+                return self.deny(409, "orchestrator already running")
+            try:
+                (ROOT / "project" / "STOP").unlink()
+            except OSError:
+                pass
+            subprocess.Popen(["cmd", "/c", "start", "", "start.bat"], cwd=ROOT)
+            if data.get("supervisor") and _procs.get("supervisor") is not True:
+                subprocess.Popen(["cmd", "/c", "start", "", "supervise.bat"], cwd=ROOT)
+        elif action == "start_supervisor":
+            if _procs.get("supervisor") is not True:
+                subprocess.Popen(["cmd", "/c", "start", "", "supervise.bat"], cwd=ROOT)
+        else:
+            return self.deny(400, "unknown action")
+        invalidate()
+        self.send(200, json.dumps({"ok": True, "flags": flags_now()}).encode("utf-8"), "application/json")
+
+    def handle_request_post(self, data: dict) -> None:
+        text = data.get("text", "")
+        if not isinstance(text, str):
+            return self.deny(400, "text must be a string")
+        text = text.strip()
+        if not text or len(text) > 2000:
+            return self.deny(400, "text must be 1-2000 chars")
+        line = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", " ")
+        stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        entry = f"- {line} _(from the Office, {stamp})_"
+        p = ROOT / "project" / "OWNER_REQUESTS.md"
+        with _write_lock:
+            atomic_write(p, insert_request(read(p), entry))  # re-read right before writing
+        office_event("OFFICE request added")
+        if data.get("plan_now") is True:
+            atomic_write(ROOT / "project" / "PLAN_NOW",
+                         f"requested from the Office at {dt.datetime.now().isoformat(timespec='seconds')}\n")
+            office_event("OFFICE plan_now requested")
+        invalidate()
+        self.send(200, json.dumps({"ok": True}).encode("utf-8"), "application/json")
+
+    def handle_probe_post(self) -> None:
+        with _probe_lock:
+            if _probe["running"]:
+                return self.deny(409, "probe already running")
+            agents = (read_json(ROOT / "orchestrator" / "config.json") or {}).get("agents") or {}
+            _probe["results"] = {n: {"state": "pending", "seconds": 0.0, "detail": ""} for n in agents}
+            _probe["running"] = True
+        threading.Thread(target=run_probe_all, args=(agents,), daemon=True).start()
+        self.send(200, json.dumps({"ok": True}).encode("utf-8"), "application/json")
+
+    def handle_notify_post(self) -> None:
+        cfg = read_json(ROOT / "orchestrator" / "config.json") or {}
+        topic = (cfg.get("notify") or {}).get("ntfy_topic")
+        if not topic:
+            return self.deny(409, "no ntfy_topic in config")
+        board = read_json(ROOT / "project" / "board.json") or {}
+        game = board.get("project") or ROOT.name
+        title = f"{game}: test from the Office".encode("ascii", "replace").decode()
+        req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=b"Test notification from the Office",
+                                     method="POST",
+                                     headers={"Title": title, "Priority": "default", "Tags": "skull"})
+        try:
+            urllib.request.urlopen(req, timeout=15).read()
+        except Exception as e:  # noqa: BLE001
+            return self.deny(502, f"notify failed: {e}"[:200])
+        self.send(200, json.dumps({"ok": True}).encode("utf-8"), "application/json")
+
 
 def main() -> int:
-    global ROOT, DEMO
+    global ROOT, DEMO, MANAGE, TOKEN, LAN_IP
     ap = argparse.ArgumentParser()
     ap.add_argument("--project", help="game folder (default: the folder this office/ is in)")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--lan", action="store_true", help="also serve on your local network (for a phone)")
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--demo", action="store_true", help="preview simulated workers without running agents or reading a project")
+    ap.add_argument("--manage", action="store_true", help="enable controls: plan/restart/stop/start, owner requests, health tools")
+    ap.add_argument("--token", help="manage-mode token (default: a random one is generated)")
     a = ap.parse_args()
     if a.project:
         ROOT = Path(a.project).resolve()
     DEMO = a.demo
+    MANAGE = a.manage
+    if MANAGE:
+        TOKEN = a.token or secrets.token_urlsafe(16)
     if not DEMO and not (ROOT / "project").is_dir():
         print(f"{ROOT} doesn't look like a game project (no project/ folder). Use --project.")
         return 1
     if not DEMO:
         threading.Thread(target=watch_processes, daemon=True).start()
     host = "0.0.0.0" if a.lan else "127.0.0.1"
+    if a.lan:
+        try:
+            LAN_IP = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            pass
     server = None
     for port in range(a.port, a.port + 20):
         try:
@@ -430,15 +764,14 @@ def main() -> int:
     if not server:
         print("No free port found.")
         return 1
-    url = f"http://localhost:{server.server_port}/"
+    q = f"?token={TOKEN}" if MANAGE else ""
+    url = f"http://localhost:{server.server_port}/{q}"
     print(f"The Office {'demo' if DEMO else 'for ' + ROOT.name} is open at {url}")
     if a.lan:
-        import socket
-        try:
-            ip = socket.gethostbyname(socket.gethostname())
-            print(f"On your phone (same Wi-Fi): http://{ip}:{server.server_port}/  (allow Python through the firewall)")
-        except OSError:
-            pass
+        if LAN_IP:
+            print(f"On your phone (same Wi-Fi): http://{LAN_IP}:{server.server_port}/{q}  (allow Python through the firewall)")
+    if MANAGE:
+        print("Manage mode is ON: the page can plan, restart, stop and start the team. Keep the token URL private.")
     print("Close this window to close the office. The team keeps working either way.")
     if not a.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()

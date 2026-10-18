@@ -193,3 +193,54 @@ select { font: inherit; background: var(--panel); color: var(--ink); border: 1px
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* manage mode: control bar, requests, health, toast */
+.controlbar {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap; flex-basis: 100%;
+  padding-top: 8px; border-top: 1px solid var(--line); margin-top: 4px;
+}
+.controlbar button, .side button {
+  font: inherit; font-size: 13px; background: var(--panel); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 6px; padding: 5px 12px; cursor: pointer;
+}
+.controlbar button:hover, .side button:hover { border-color: var(--accent); }
+.controlbar button:disabled, .side button:disabled { opacity: .5; cursor: default; }
+#btnStop { border-color: var(--bad); color: var(--bad); }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip.flag {
+  font-family: "Departure Mono", ui-monospace, monospace; font-size: 11px;
+  background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn);
+  border-radius: 999px; padding: 2px 6px 2px 10px;
+}
+.chip.flag button { background: none; border: none; color: inherit; cursor: pointer; padding: 0 4px; font-size: 11px; }
+.panel h3 {
+  font-family: "Departure Mono", ui-monospace, monospace; font-size: 12px; font-weight: normal;
+  color: var(--muted); margin: 10px 0 4px; text-transform: uppercase; letter-spacing: .04em;
+}
+.panel textarea {
+  width: 100%; font: inherit; font-size: 13px; background: var(--bg); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; resize: vertical;
+}
+.panel .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; font-size: 13px; color: var(--muted); }
+.panel .btns { flex-wrap: wrap; }
+.reqlist, .probelist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.reqlist li { overflow: hidden; text-overflow: ellipsis; }
+.reqlist .chip { font-family: "Departure Mono", ui-monospace, monospace; font-size: 10px; background: var(--bar-bg); border-radius: 4px; padding: 0 5px; }
+.probe { display: flex; gap: 8px; align-items: baseline; }
+.probe .pname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.probe .pbadge {
+  font-family: "Departure Mono", ui-monospace, monospace; font-size: 10px; border-radius: 4px;
+  padding: 0 5px; background: var(--bar-bg); color: var(--muted); margin-left: auto; flex: none;
+}
+.probe.ok .pbadge { background: color-mix(in srgb, var(--good) 20%, transparent); color: var(--good); }
+.probe.fail .pbadge, .probe.timeout .pbadge { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad); }
+.probe .psecs { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+.toast {
+  position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); z-index: 50;
+  font-family: "Departure Mono", ui-monospace, monospace; font-size: 13px;
+  background: #1a1c2c; color: #f4f4f4; border-radius: 8px; padding: 8px 16px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, .35); max-width: min(92vw, 420px); text-align: center;
+}
+@media (max-width: 520px) {
+  .controlbar button { padding: 5px 8px; font-size: 12px; }
+}
