@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.1 (unreleased)
+
+Office zones: the work floor, planning office and break room are separate zones with
+glass/partition walls and doorways (`template/office/layout.js` with BFS routing, loaded
+before `office.js`). Working agents sit at lane desks, `PLAN_SPOT` or the supervisor seat;
+idle/napping/benched agents stay in the break room; pets never enter planning. Routes never
+cross walls except through door gaps, the planning lights fade off when nobody plans, and
+`tests/office_layout.test.js` (+ Python wrapper) covers zones, overlaps and routing.
+
 ## 1.2.0 (2026-10-18)
 
 The Office grows a manage mode (`office-manage.bat` / `office/server.py --manage`): token-URL auth

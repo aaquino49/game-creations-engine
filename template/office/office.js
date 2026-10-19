@@ -102,43 +102,60 @@ function blit(r, x, y, flip = false) {
   ctx.drawImage(sheet, sx, sy, w, h, 0, 0, w, h); ctx.restore();
 }
 
-// ------------------------------------------------------------------ layout
+// ------------------------------------------------------------------ layout (zones via OfficeLayout)
 
 let L = null; // built once we know how many lanes there are
-const IDLE_SPOTS = [[16, 57, "vending"], [36, 57, "cooler"], [52, 58, "coffee"], [64, 57, "coffee"], [90, 57, "window"],
-  [178, 58, "plant"], [214, 74, "lounge"], [230, 78, "lounge"], [262, 72, "lounge"], [278, 76, "lounge"], [302, 66, "fridge"],
-  [196, 100, "lounge"], [304, 152, "lounge"], [252, 96, "lounge"]];
-const NAP_SEATS = [[241, 50], [257, 50], [221, 120], [237, 120], [275, 120], [291, 120]];
-const NAP_FLOOR = [[210, 160], [300, 100], [196, 140], [226, 150]];
-const DOOR = { x: 168, y: 50 };
-const PLAN_SPOT = { x: 96, y: 57 };
-const COLS = [3, 92, 187];
+const OL = (typeof window !== "undefined" && window.OfficeLayout) || (typeof globalThis !== "undefined" && globalThis.OfficeLayout) || null;
+let IDLE_SPOTS = OL ? OL.IDLE_SPOTS : [];
+let NAP_SEATS = OL ? OL.NAP_SEATS : [];
+let NAP_FLOOR = OL ? OL.NAP_FLOOR : [];
+let CAT_SPOTS = OL ? OL.CAT_SPOTS : [];
+let DOOR = OL ? OL.DOOR : { x: 168, y: 50 };
+let PLAN_SPOT = OL ? OL.PLAN_SPOT : { x: 49, y: 58 };
+let WB = OL ? OL.WB : { x: 26, y: 7, w: 46, h: 28 };
+let planLight = 0, planLightAt = 0; // planning-office lights fade (400 ms)
+
+function propSprite(kind) {
+  if (kind === "tableS") return R.tableS;
+  if (kind === "tableL") return R.tableL;
+  if (kind === "vending") return R.vending;
+  if (kind === "cooler") return R.cooler;
+  if (kind === "plant") return R.plant;
+  if (kind === "couchOrg") return R.couchOrg;
+  if (kind === "couchBlu") return R.couchBlu;
+  if (kind === "couchGrn") return R.couchGrn;
+  if (kind === "fridge") return R.fridge;
+  if (kind === "binG") return R.binG;
+  return R.chairs[5];
+}
 
 function buildLayout(nLanes) {
-  const rows = Math.max(2, Math.ceil(nLanes / 4));
-  H = Math.max(182, 70 + rows * 42 + 34);
+  const lay = OL.buildLayout(nLanes);
+  H = lay.H;
   cvs.height = H;
-  const pairs = [], desks = [], aisles = [56];
-  for (let r = 0; r < rows; r++) {
-    for (const x of [8, 98]) pairs.push({ x, y: 70 + r * 42 });
-    aisles.push(70 + r * 42 + 36);
-  }
-  aisles.push(H - 6);
-  for (const p of pairs) {
-    desks.push({ pair: p, cx: p.x + 15, by: p.y + 27, screen: [p.x + 26, p.y + 8, 7, 7], plate: [p.x + 21, p.y + 31] });
-    desks.push({ pair: p, cx: p.x + 64, by: p.y + 27, screen: [p.x + 46, p.y + 8, 7, 7], plate: [p.x + 58, p.y + 31] });
-  }
-  const bossY = H - 22;
-  L = { rows, pairs, desks, aisles, boss: { x: 246, y: bossY + 16, tableY: bossY }, bed: { x: 214, y: H - 14 } };
+  IDLE_SPOTS = lay.IDLE_SPOTS; NAP_SEATS = lay.NAP_SEATS; NAP_FLOOR = lay.NAP_FLOOR;
+  CAT_SPOTS = lay.CAT_SPOTS; DOOR = lay.DOOR; PLAN_SPOT = lay.PLAN_SPOT; WB = lay.WB;
+  L = lay;
   // scenery that sorts with the characters (x, y = top-left; sort by bottom edge)
-  L.props = [
-    [R.vending, 4, 16], [R.cooler, 31, 33], [R.tableS, 42, 34], [R.coffee, 47, 27, 0.2], [R.mug, 58, 31, 0.2],
-    [R.plant, 184, 31], [R.couchOrg, 232, 34], [R.plant, 268, 31], [R.fridge, 290, 19],
-    [R.couchBlu, 212, 104], [R.couchGrn, 266, 104], [R.tableS, 252, 126], [R.mug, 262, 123, 0.2], [R.plant, 302, 128],
-    [R.binG, 182, 142], [R.tableL, 252, bossY], [R.computer, 264, bossY - 12, 0.2], [R.paper, 284, bossY - 4, 0.2],
-    [R.chairs[5], 236, bossY - 6, -0.5],
-  ].map(([r, x, y, bias = 0]) => ({ r, x, y, sort: y + r[3] + bias }));
+  L.props = lay.props.map(p => ({ r: propSprite(p.kind), x: p.x, y: p.y, sort: p.y + p.h + (p.kind === "chair" ? -0.5 : 0) }));
+  // small things that sit on tables (no floor footprint, so not in layout.props)
+  const dress = [
+    [R.mug, 262, 123, 0.2],
+    [R.coffee, 203, L.props.find(p => p.x === 198 && p.r === R.tableS).y - 7, 0.2],
+    [R.mug, 214, L.props.find(p => p.x === 198 && p.r === R.tableS).y - 3, 0.2],
+    [R.computer, 46, L.boss.tableY - 12, 0.2], [R.paper, 60, L.boss.tableY - 4, 0.2],
+  ];
+  for (const [r, x, y, bias] of dress) L.props.push({ r, x, y, sort: y + r[3] + bias });
+  // the planning-office front glass wall sorts at y=85, over the feet inside
+  L.glassFront = { y: 85 };
   L.bg = paintBackground();
+}
+
+function glassStyle(g, x, y, w, h) { // 2px #73eff7 at 45% + 1px #566c86 frame
+  g.save(); g.globalAlpha = 0.45; g.fillStyle = "#73eff7"; g.fillRect(x, y, w, h); g.restore();
+  g.fillStyle = "#566c86";
+  if (w >= h) { g.fillRect(x, y, w, 1); }
+  else { g.fillRect(x, y, 1, h); }
 }
 
 function paintBackground() {
@@ -151,24 +168,51 @@ function paintBackground() {
   g.fillStyle = "#94b0c2"; for (const y of [14, 24, 34]) g.fillRect(0, y, W, 1);
   g.fillStyle = "#566c86"; g.fillRect(0, FLOOR_Y - 2, W, 1);
   g.fillStyle = "#ffcd75"; g.fillRect(0, FLOOR_Y - 1, W, 1);
-  // floor planks (same pattern as the pack's floor)
-  for (let y = FLOOR_Y, row = 0; y < H; y += 8, row++) {
-    g.fillStyle = "#41a6f6"; g.fillRect(0, y, W, 8);
-    g.fillStyle = "#73eff7"; g.fillRect(0, y, W, 1);
-    g.fillStyle = "#29366f"; g.fillRect(0, y + 7, W, 1);
-    for (let x = (row % 2) * 36 - 36; x < W; x += 73) {
-      g.fillStyle = "#29366f"; g.fillRect(x, y, 1, 8);
-      g.fillStyle = "#73eff7"; g.fillRect(x + 1, y + 1, 1, 6);
+  // floors: blue planks on the work floor, warm wood in the break room, carpet in planning
+  const plank = (x0, x1, y, base, hi, dark) => {
+    g.fillStyle = base; g.fillRect(x0, y, x1 - x0, 8);
+    g.fillStyle = hi; g.fillRect(x0, y, x1 - x0, 1);
+    g.fillStyle = dark; g.fillRect(x0, y + 7, x1 - x0, 1);
+  };
+  const seams = (x0, x1, y, row, dark, hi) => {
+    for (let x = (row % 2) * 36 - 36 + x0; x < x1; x += 73) {
+      g.fillStyle = dark; g.fillRect(x, y, 1, 8);
+      g.fillStyle = hi; g.fillRect(x + 1, y + 1, 1, 6);
     }
+  };
+  let row = 0;
+  for (let y = FLOOR_Y; y < H; y += 8, row++) {
+    plank(0, 188, y, "#41a6f6", "#73eff7", "#29366f"); // work floor, left part
+    seams(0, 188, y, row, "#29366f", "#73eff7");
+    if (y < 86) { plank(98, 188, y, "#41a6f6", "#73eff7", "#29366f"); seams(98, 188, y, row, "#29366f", "#73eff7"); }
+    plank(192, W, y, "#ef7d57", "#ffcd75", "#b13e53"); // break room warm wood
+    seams(192, W, y, row, "#b13e53", "#ffcd75");
   }
+  // planning-office carpet with a dotted checker
+  g.fillStyle = "#333c57"; g.fillRect(0, FLOOR_Y, 97, 39);
+  g.fillStyle = "#566c86";
+  for (let y = FLOOR_Y; y < 85; y += 4) for (let x = (y % 8 ? 0 : 2); x < 97; x += 4) g.fillRect(x, y, 1, 1);
   const put = (r, x, y) => g.drawImage(sheet, r[0], r[1], r[2], r[3], x, y, r[2], r[3]);
-  put(R.window2, 76, 10); put(R.window, 200, 10); put(R.calendar, 62, 18); put(R.picture, 300, 8);
+  put(R.window2, 108, 10); put(R.window, 240, 10); put(R.calendar, 136, 18); put(R.picture, 300, 8);
   put(R.door, 160, 15); put(R.clock, 158, 7);
   g.fillStyle = "#1a1c2c"; g.fillRect(159, 8, 17, 4); // blank the sprite's 12:00; the real time is drawn on top
-  // whiteboard (planning)
-  g.fillStyle = "#566c86"; g.fillRect(105, 7, 46, 28);
-  g.fillStyle = "#f4f4f4"; g.fillRect(107, 9, 42, 24);
-  g.fillStyle = "#94b0c2"; g.fillRect(106, 35, 44, 2);
+  // whiteboard (planning) from one constant so art and overlays can't drift
+  g.fillStyle = "#566c86"; g.fillRect(WB.x, WB.y, WB.w, WB.h);
+  g.fillStyle = "#f4f4f4"; g.fillRect(WB.x + 2, WB.y + 2, WB.w - 4, WB.h - 4);
+  g.fillStyle = "#94b0c2"; g.fillRect(WB.x + 1, WB.y + WB.h, WB.w - 2, 2);
+  // planning glass right wall (door gap y 50-63); front glass draws sorted in drawScene
+  glassStyle(g, 96, 46, 2, 4); glassStyle(g, 96, 63, 2, 22);
+  g.fillStyle = "#566c86"; g.fillRect(96, 50, 2, 1); g.fillRect(96, 62, 2, 1);
+  // partition wall x 188-191 with doorway gaps y 50-63 and 118-135
+  const span = (y0, y1) => {
+    if (y1 <= y0) return;
+    g.fillStyle = "#566c86"; g.fillRect(188, y0, 4, y1 - y0);
+    g.fillStyle = "#94b0c2"; g.fillRect(188, y0, 1, y1 - y0);
+    g.fillStyle = "#333c57"; g.fillRect(191, y0, 1, y1 - y0);
+  };
+  span(46, 50); span(63, 118); span(135, H);
+  g.fillStyle = "#566c86";
+  for (const y of [50, 62, 118, 134]) g.fillRect(188, y, 4, 1);
   // lounge rug and the supervisor's dog bed
   g.fillStyle = "#c15b82"; g.fillRect(203, 96, 114, 52);
   g.fillStyle = "#e58fb0"; g.fillRect(205, 98, 110, 48);
@@ -186,19 +230,7 @@ let deskInfo = []; // per desk: lane state from the server
 const deskFx = {};  // desk index -> {alert, until, cloudUntil}
 const now = () => performance.now() / 1000;
 
-function nearest(list, v) { return list.reduce((a, b) => Math.abs(b - v) < Math.abs(a - v) ? b : a); }
-function route(a, b) {
-  if (a.x > 192 && b.x > 192) return [{ x: b.x, y: b.y }];
-  const pts = [];
-  const ay = nearest(L.aisles, a.y), by = nearest(L.aisles, b.y);
-  if (Math.abs(a.y - ay) > 1) pts.push({ x: a.x, y: ay });
-  if (ay !== by) {
-    const cx = nearest(COLS, (a.x + b.x) / 2);
-    pts.push({ x: cx, y: ay }, { x: cx, y: by });
-  }
-  pts.push({ x: b.x, y: by }, { x: b.x, y: b.y });
-  return pts;
-}
+function route(a, b) { return OL.route(L, a, b); }
 
 function makeChar(id, agent, idx, x, y) {
   return { id, agent, sprite: makeSprite(agent, idx), x, y, path: [], mode: "stand", targetKey: "", targetMode: "stand",
@@ -273,7 +305,7 @@ function updatePets(t, dt) {
   }
   if (cat) {
     if (!cat.path.length && t > cat.nextAt) {
-      const spots = [[240, 52], [300, 60], [230, 132], [290, 140], [196, 64], [120, 58], [60, 62]];
+      const spots = CAT_SPOTS;
       const [x, y] = spots[Math.floor(Math.random() * spots.length)];
       cat.path = route(cat, { x, y }); cat.mode = "walk"; cat.targetMode = Math.random() < 0.5 ? "sleep" : "stand";
       cat.nextAt = t + 20 + Math.random() * 30;
@@ -300,7 +332,7 @@ function laneDesk(name) {
 }
 function spotFor(job) {
   if (job.station === "plan") return { x: PLAN_SPOT.x, y: PLAN_SPOT.y, mode: "stand", key: "plan" };
-  if (job.station === "boss") return { x: L.boss.x - 8, y: L.boss.y - 1, mode: "sit", key: "boss" };
+  if (job.station === "boss") return { x: L.boss.x, y: L.boss.y, mode: "sit", key: "boss" };
   const i = laneDesk(job.station.split(":")[1]), d = L.desks[i];
   return { x: d.cx, y: d.by, mode: "sit", key: "desk" + i, desk: i };
 }
@@ -477,21 +509,26 @@ function effect(ev) {
 
 // ------------------------------------------------------------------ drawing
 
+function drawGlassFront() {
+  ctx.save(); ctx.globalAlpha = 0.45; ctx.fillStyle = "#73eff7"; ctx.fillRect(0, 84, 97, 2); ctx.restore();
+  ctx.fillStyle = "#566c86"; ctx.fillRect(0, 84, 97, 1);
+}
+
 function drawScene(t) {
   ctx.clearRect(0, 0, W, H);
   ctx.drawImage(L.bg, 0, 0);
-  // whiteboard: current milestone progress, scribbles while planning
+  // whiteboard: current milestone progress, scribbles while planning (all from WB)
   const cur = STATE && STATE.milestones.find(m => m.done < m.total);
   if (cur) {
-    ctx.fillStyle = "#94b0c2"; ctx.fillRect(110, 27, 36, 4);
-    ctx.fillStyle = "#38b764"; ctx.fillRect(110, 27, Math.round(36 * cur.done / cur.total), 4);
+    ctx.fillStyle = "#94b0c2"; ctx.fillRect(WB.x + 5, 27, 36, 4);
+    ctx.fillStyle = "#38b764"; ctx.fillRect(WB.x + 5, 27, Math.round(36 * cur.done / cur.total), 4);
   }
   if (STATE && STATE.planner && STATE.planner.busy) {
     ctx.fillStyle = "#3b5dc9";
     const n = Math.floor(t * 2) % 7 + 2;
-    for (let i = 0; i < n; i++) { const r = (i * 9301 + 49297) % 233280 / 233280; ctx.fillRect(110 + (i % 2) * 18, 19 + Math.floor(i / 2) * 2, 6 + Math.round(r * 10), 1); }
+    for (let i = 0; i < n; i++) { const r = (i * 9301 + 49297) % 233280 / 233280; ctx.fillRect(WB.x + 5 + (i % 2) * 18, 19 + Math.floor(i / 2) * 2, 6 + Math.round(r * 10), 1); }
   }
-  // sorted drawables
+  // sorted drawables (the front glass wall sorts at y=85, over inside feet)
   const items = [];
   for (const p of L.props) items.push({ s: p.sort, f: () => blit(p.r, p.x, p.y) });
   L.pairs.forEach(p => items.push({ s: p.y + 31, f: () => drawDeskPair(p, t) }));
@@ -500,7 +537,21 @@ function drawScene(t) {
     items.push({ s, f: () => drawChar(ch, t) });
   }
   for (const p of Object.values(pets)) items.push({ s: p.y, f: () => drawPet(p, t) });
+  items.push({ s: 85, f: drawGlassFront });
   items.sort((a, b) => a.s - b.s).forEach(i => i.f());
+  // planning-office lights: dark when nobody holds a plan job, fading over 400 ms
+  try {
+    const planning = !!(STATE && (STATE.jobs || []).some(j => j.station === "plan"));
+    const target = planning ? 0 : 0.35;
+    if (reducedMotion.matches) planLight = target;
+    else {
+      const dt = Math.min(0.5, Math.max(0, t - (planLightAt || t)));
+      const step = dt / 0.4;
+      planLight += Math.max(-step * 0.35, Math.min(step * 0.35, target - planLight));
+    }
+    planLightAt = t;
+    if (planLight > 0.003) { ctx.fillStyle = `rgba(26,28,44,${planLight.toFixed(3)})`; ctx.fillRect(0, 46, 97, 39); }
+  } catch (e) {}
   // particles
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i]; ctx.fillStyle = p.c; ctx.fillRect(Math.round(p.x), Math.round(p.y), 2, 2);
@@ -614,10 +665,12 @@ function drawOverlay(t) {
     if (p.say && p.say.until > t) ov("say" + p.id, "bubble woof", p.say.text, p.x, p.y - R[p.kind][3] - 3);
     else if (p.mode === "sleep" && !p.path.length) ov("z" + p.id, "emoji", "💤", p.x + 8, p.y - 8);
   }
+  ov("supPlate", "plate", "Supervisor", L.boss.tableX + 20, L.boss.tableY - 12, "Supervisor corner: the fixer sits here");
+  ov("breakPlate", "plate", "Break room", 214, 60, "Break room: idle, napping and benched agents");
   ov("clock", "clocktext", STATE.time || "", 167.5, 10);
   ovEls.get("clock").style.fontSize = Math.max(7, Math.round(4.6 * scale)) + "px";
   const cur = STATE.milestones.find(m => m.done < m.total);
-  ov("board", "boardtext", cur ? `${cur.id} ${cur.done}/${cur.total}` : (STATE.complete ? "done!" : ""), 128, 10);
+  ov("board", "boardtext", cur ? `${cur.id} ${cur.done}/${cur.total}` : (STATE.complete ? "done!" : ""), WB.x + WB.w / 2, 10);
   if (scale) { const el = ovEls.get("board"); el.style.fontSize = Math.max(8, Math.round(6.5 * scale)) + "px"; }
   for (const [k, el] of ovEls) if (!el._seen) { el.remove(); ovEls.delete(k); }
 }
@@ -837,6 +890,10 @@ loaded.then(() => { poll(); requestAnimationFrame(frame); }).catch(error => {
 
 // Deep links (?view=board|graph, ?task=T-12), captured before the token is stripped from the address bar.
 const DEEP = new URLSearchParams(location.search);
+{ // deep link ?scene=working|idle|limits|... picks the demo scene
+  const sel = document.getElementById("scene"), want = DEEP.get("scene");
+  if (want && [...sel.options].some(o => o.value === want)) sel.value = want;
+}
 let OFFICE_TOKEN = new URLSearchParams(location.search).get("token") || "";
 try {
   if (OFFICE_TOKEN) sessionStorage.setItem("officeToken", OFFICE_TOKEN);
