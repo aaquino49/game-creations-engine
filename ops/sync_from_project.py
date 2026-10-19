@@ -53,7 +53,9 @@ def project_identity(project: Path) -> dict:
     if lanes:
         m = re.search(r"([A-Za-z0-9]+)_lane[A-Z]$", Path(lanes[0]["dir"]).name)
         slug = m.group(1) if m else ""
-    topic = (cfg.get("notify") or {}).get("ntfy_topic", "")
+    local_cfg = project / "orchestrator" / "config.local.json"
+    local = json.loads(local_cfg.read_text(encoding="utf-8")) if local_cfg.exists() else {}
+    topic = (local.get("notify") or {}).get("ntfy_topic") or (cfg.get("notify") or {}).get("ntfy_topic", "")
     return {"name": name, "exe": exe, "slug": slug, "topic": topic}
 
 

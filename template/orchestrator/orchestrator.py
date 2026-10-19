@@ -36,6 +36,11 @@ STATUS_PATH = PROJECT / "STATUS.md"
 EVENTS_PATH = PROJECT / "events.log"
 PM_NOTES = PROJECT / "PM_NOTES.md"
 CONFIG = json.loads((Path(__file__).parent / "config.json").read_text(encoding="utf-8"))
+# Owner-only settings (the ntfy topic) live in the untracked config.local.json; its keys override config.json's.
+_LOCAL_CONFIG = Path(__file__).parent / "config.local.json"
+if _LOCAL_CONFIG.exists():
+    for _k, _v in json.loads(_LOCAL_CONFIG.read_text(encoding="utf-8")).items():
+        CONFIG[_k] = {**CONFIG.get(_k, {}), **_v} if isinstance(_v, dict) else _v
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 GODOT_ERROR_RE = re.compile(r"(SCRIPT ERROR|Parse Error|^\s*ERROR:)", re.M)

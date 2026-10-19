@@ -217,6 +217,16 @@ class NotifyTest(OfficeCase):
             self.assertIn("test from the Office", req.get_header("Title"))
             self.assertEqual(open_.call_args[1].get("timeout"), 15)
 
+    def test_notify_reads_untracked_local_config(self):
+        """The scaffold keeps the topic in config.local.json (git-ignored); it wins over config.json."""
+        self.start(manage=True, topic=None)
+        (Path(self.root) / "orchestrator" / "config.local.json").write_text(
+            json.dumps({"notify": {"ntfy_topic": "local-topic"}}), encoding="utf-8")
+        with mock.patch("urllib.request.urlopen") as open_:
+            code, d = self.post("/api/notify-test", {})
+            self.assertEqual(code, 200)
+            self.assertEqual(open_.call_args[0][0].full_url, "https://ntfy.sh/local-topic")
+
 
 class DemoMode(OfficeCase):
     """Acceptance 8: in demo mode every POST is 409 demo mode."""

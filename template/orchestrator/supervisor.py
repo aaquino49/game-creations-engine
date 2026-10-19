@@ -26,7 +26,13 @@ SUP_RUNS = PROJECT / "runs" / "_supervisor"
 
 
 def config() -> dict:
-    return json.loads((ROOT / "orchestrator" / "config.json").read_text(encoding="utf-8"))
+    cfg = json.loads((ROOT / "orchestrator" / "config.json").read_text(encoding="utf-8"))
+    # Owner-only settings (the ntfy topic) live in the untracked config.local.json; its keys override config.json's.
+    local = ROOT / "orchestrator" / "config.local.json"
+    if local.exists():
+        for k, v in json.loads(local.read_text(encoding="utf-8")).items():
+            cfg[k] = {**cfg.get(k, {}), **v} if isinstance(v, dict) else v
+    return cfg
 
 
 def scfg() -> dict:

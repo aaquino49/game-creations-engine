@@ -88,7 +88,7 @@ Lessons that aren't code:
 | Stop after the current step | `stop.bat` (creates `project/STOP`) |
 | Reload code between tasks | create `project/RESTART` (commit orchestrator changes first) |
 | Plan right now (e.g. after adding an owner request) | create `project/PLAN_NOW`; a background plan starts within ~30 s even if every lane is busy |
-| Watch | `project/STATUS.md` (lanes, planner, milestones, PM notes), `project/events.log`, ntfy topic in config |
+| Watch | `project/STATUS.md` (lanes, planner, milestones, PM notes), `project/events.log`, ntfy topic in `orchestrator/config.local.json` (untracked) |
 | Steer | add a line under **Open** in `project/OWNER_REQUESTS.md` |
 | Change models | edit the position's `model` (and matching `-m` in its `cmd`) in `orchestrator/config.json`, commit, `project/RESTART`; reorder `coders` / `fallback` for priority |
 | Never | edit `project/board.json` while the orchestrator runs |

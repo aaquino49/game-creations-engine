@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 test_harness/fake_godot.cmd
 ops/build_logs/
+# Working notes for whoever continues the engine; kept local, not published
+HANDOFF.md

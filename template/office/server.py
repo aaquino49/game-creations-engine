@@ -1949,7 +1949,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_notify_post(self) -> None:
         cfg = read_json(ROOT / "orchestrator" / "config.json") or {}
-        topic = (cfg.get("notify") or {}).get("ntfy_topic")
+        local = read_json(ROOT / "orchestrator" / "config.local.json") or {}  # untracked; holds the topic
+        topic = (local.get("notify") or {}).get("ntfy_topic") or (cfg.get("notify") or {}).get("ntfy_topic")
         if not topic:
             return self.deny(409, "no ntfy_topic in config")
         board = read_json(ROOT / "project" / "board.json") or {}

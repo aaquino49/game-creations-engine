@@ -9,6 +9,12 @@ idle/napping/benched agents stay in the break room; pets never enter planning. R
 cross walls except through door gaps, the planning lights fade off when nobody plans, and
 `tests/office_layout.test.js` (+ Python wrapper) covers zones, overlaps and routing.
 
+Phone-alert topics stay out of git: `scaffold.py` writes the ntfy topic to
+`orchestrator/config.local.json`, which the template's `.gitignore` excludes, and leaves
+`notify.ntfy_topic` empty in `config.json`. The orchestrator, supervisor, Office notify test and
+`ops/sync_from_project.py` read the local file first and still accept a topic in `config.json`
+for older projects. The generated game README no longer prints the topic. Added an MIT `LICENSE`.
+
 ## 1.2.0 (2026-10-18)
 
 The Office grows a manage mode (`office-manage.bat` / `office/server.py --manage`): token-URL auth

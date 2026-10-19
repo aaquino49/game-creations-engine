@@ -34,3 +34,6 @@ builds/
 /game/tmp_*
 /game/dev_compile.gd*
 project/RESTART
+
+# Owner-only settings (ntfy topic): anyone who knows the topic can read and send alerts
+orchestrator/config.local.json

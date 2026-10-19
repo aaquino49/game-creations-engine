@@ -113,7 +113,7 @@ Then, in the new folder:
 | I want to… | Do this |
 |---|---|
 | See how it's going | `python "<engine>\ops\status.py" "<game>"`, or open `project/STATUS.md` (lanes, planner, milestones) and `project/events.log` |
-| Get phone alerts | Subscribe to the ntfy topic in `orchestrator/config.json` → `notify.ntfy_topic` |
+| Get phone alerts | Subscribe to the ntfy topic in `orchestrator/config.local.json` → `notify.ntfy_topic`. That file is git-ignored on purpose: anyone who knows the topic can read and send your alerts |
 | Ask for a change | Add a line under **Open** in `project/OWNER_REQUESTS.md` (see [the Grim Haven one](examples/grim-haven/OWNER_REQUESTS.md)). Then create an empty file `project/PLAN_NOW` so it's planned within ~30 seconds instead of at the next routine plan |
 | Stop after the current step | `stop.bat` (creates `project/STOP`). Delete `project/STOP` and run `start.bat` to resume |
 | Stop at a milestone | Set `"stop_after_milestone": "M8"` in `orchestrator/config.json`, commit, create `project/RESTART` |
@@ -227,3 +227,7 @@ skill/
   SKILL.md                master copy of the Claude Code skill (/ai-game-studio)
   install_skill.py        installs it to ~/.claude/skills/ai-game-studio, pointing at this folder
 ```
+
+## License
+
+MIT; see [LICENSE](LICENSE). The bundled Office art (CC0) and font (SIL OFL 1.1) keep their own licences, included in `template/office/assets/`.

@@ -28,7 +28,7 @@ Each task goes **work â†’ automatic checks (import, tests, smoke, screenshot) â†
 | Plan right now (after adding an owner request) | create an empty `project/PLAN_NOW` |
 | Live status | `project/STATUS.md` |
 | Full event log | `project/events.log` |
-| Phone alerts | ntfy.sh topic `{{NTFY_TOPIC}}` (ntfy app, or https://ntfy.sh/{{NTFY_TOPIC}}) |
+| Phone alerts | subscribe in the ntfy app to the topic in `orchestrator/config.local.json` (untracked: anyone who knows the topic can read and send alerts) |
 | Steer the team | write a request under **Open** in `project/OWNER_REQUESTS.md` |
 | Change models | edit `coders` / `fallback` in `orchestrator/config.json`, commit, create `project/RESTART` |
 
