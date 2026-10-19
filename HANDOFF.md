@@ -22,6 +22,7 @@ don't: current state, decisions, what QA caught, and what's left.
   | `7d7b49d` | Phase 3: Stats and Notes views, incident log, build + Play, demo data; Phase 4 spec |
   | `d606fa2` | Phase 4: Settings, bench, approval gate, spend cap; bump to 1.2.0 |
   | `1267afd` | Polish: graph fit, chart axes, consistent demo roster |
+| `5fd7866` | Zones: planning office (lights on only while planning), work floor + supervisor corner, break room; routing in `layout.js` (1.2.1, unreleased) |
 
 ## How the work was done (reuse this workflow)
 
@@ -51,7 +52,8 @@ The owner wanted **Claude to write the specs and do QA, while Muse Spark 1.3 Con
   `server.py --project <dir> --manage --token X`.
 - Screenshot with headless Edge:
   `msedge --headless=new --window-size=1400,900 --virtual-time-budget=9000 --screenshot=out.png "http://localhost:879x/?token=X&view=stats"`
-- Deep links: `?view=office|board|graph|stats|notes|settings` and `?task=T-12`.
+- Deep links: `?view=office|board|graph|stats|notes|settings`, `?task=T-12`, and `?scene=working|checks|idle|limits|complete|closed` (demo).
+- Capture the browser console: add `--enable-logging=stderr --v=0 --dump-dom` and grep for `CONSOLE`. A blank scene with empty panels means a JS error.
 - **Gotcha:** headless Edge never renders narrower than 496 px. A `--window-size=390` screenshot is laid out at
   496 px and then cropped, so it looks like horizontal overflow when there is none. Use 500 px for narrow checks.
 - Stop servers afterwards:
@@ -115,6 +117,7 @@ Keep these failure modes in mind when reviewing future work:
 8. **Model ids** could start with `-` and be read as an extra CLI flag. They're rejected now.
 9. **New OpenCode positions** from Settings were missing `watch_rate_limit`, so a rate limit would hang until
    timeout.
+11. **Leaked globals in `layout.js`:** its top-level `const`s collided with `office.js` in the shared browser scope, a SyntaxError that blanked the page. `node --check` and the Node-only test both passed. It's now wrapped in an IIFE, and `tests/office_layout.test.js` loads it the way a browser does.
 10. **Clipped throughput chart:** its wrapper cropped the x labels and the 0 baseline. The SVG height is capped
     instead.
 
